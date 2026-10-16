@@ -5,7 +5,7 @@
 
 Static tables: Team, TeamMember.
 Dynamic (per-session) tables: TeamTask, TeamTaskDependency, TeamMessage,
-MessageReadStatus, TeamTaskReviewVote.
+MessageReadStatus, TeamTaskReviewVote, TeamMeeting, TeamSpeechRequest.
 Configuration: DatabaseType, DatabaseConfig.
 """
 
@@ -26,6 +26,8 @@ TEAM_DYNAMIC_TABLE_PREFIXES = (
     "team_message_",
     "message_read_status_",
     "team_review_vote_",
+    "team_speech_request_",
+    "team_meeting_",
 )
 TEAM_STATIC_TABLES_TO_CLEAR = (
     "team_info",
@@ -103,6 +105,39 @@ class TeamMember(SQLModel, table=True):
 
 
 # ============== Dynamic Table Base Classes (abstract) ==============
+
+
+class TeamMeetingBase(SQLModel):
+    """Base for meeting speaking state tables, one table per session."""
+
+    __abstract__ = True
+
+    team_name: str = Field(primary_key=True, foreign_key="team_info.team_name", ondelete="CASCADE")
+    meeting_id: str = Field(primary_key=True)
+    leader_member_name: str
+    addressed_members: str = Field(default="[]")
+    next_sequence: int = Field(default=0, sa_type=BigInteger)
+    revision: int = Field(default=0, sa_type=BigInteger)
+    closed: bool = Field(default=False)
+    owner_request_id: str | None = Field(default=None)
+    lease_token: str | None = Field(default=None)
+    interruption_id: str | None = Field(default=None)
+
+
+class TeamSpeechRequestBase(SQLModel):
+    """Base for speech request tables, one table per session; no outgoing message text."""
+
+    __abstract__ = True
+
+    team_name: str = Field(primary_key=True, foreign_key="team_info.team_name", ondelete="CASCADE")
+    meeting_id: str = Field(primary_key=True)
+    request_id: str = Field(primary_key=True)
+    member_name: str
+    sequence: int = Field(sa_type=BigInteger)
+    status: str = Field(default="queued")
+    lease_token: str | None = Field(default=None)
+    created_at: int = Field(sa_type=BigInteger)
+    granted_at: int | None = Field(default=None, sa_type=BigInteger)
 
 
 class TeamTaskBase(SQLModel):
@@ -346,6 +381,38 @@ _task_dependency_models: Dict[str, type[TeamTaskDependencyBase]] = {}
 _message_models: Dict[str, type[TeamMessageBase]] = {}
 _message_read_status_models: Dict[str, type[MessageReadStatusBase]] = {}
 _review_vote_models: Dict[str, type[TeamTaskReviewVoteBase]] = {}
+_meeting_models: dict[str, type[TeamMeetingBase]] = {}
+_speech_request_models: dict[str, type[TeamSpeechRequestBase]] = {}
+
+
+def _get_meeting_model(session_id: str | None = None) -> type[TeamMeetingBase]:
+    """Get or create the meeting model for an explicit or currently bound session."""
+    session_id = get_session_id() if session_id is None else session_id
+    if not session_id:
+        raise ValueError("A session ID is required for meeting tables")
+    if session_id not in _meeting_models:
+        suffix = _sanitize_session_id_for_table(session_id)
+        attrs = {"__tablename__": f"team_meeting_{suffix}"}
+        model_cls = SQLModelMetaclass(f"TeamMeeting_{suffix}", (TeamMeetingBase,), attrs, table=True)
+        _meeting_models[session_id] = cast(type[TeamMeetingBase], model_cls)
+    return _meeting_models[session_id]
+
+
+def _get_speech_request_model(session_id: str | None = None) -> type[TeamSpeechRequestBase]:
+    """Get or create the speech request model for an explicit or bound session."""
+    session_id = get_session_id() if session_id is None else session_id
+    if not session_id:
+        raise ValueError("A session ID is required for speech request tables")
+    if session_id not in _speech_request_models:
+        suffix = _sanitize_session_id_for_table(session_id)
+        table_name = f"team_speech_request_{suffix}"
+        attrs = {
+            "__tablename__": table_name,
+            "__table_args__": (Index(f"ix_{table_name}_pending", "team_name", "meeting_id", "status", "sequence"),),
+        }
+        model_cls = SQLModelMetaclass(f"TeamSpeechRequest_{suffix}", (TeamSpeechRequestBase,), attrs, table=True)
+        _speech_request_models[session_id] = cast(type[TeamSpeechRequestBase], model_cls)
+    return _speech_request_models[session_id]
 
 
 def _get_task_model() -> type[TeamTaskBase]:
@@ -513,3 +580,5 @@ def _clear_session_model_cache(session_id: str) -> None:
     _message_models.pop(session_id, None)
     _message_read_status_models.pop(session_id, None)
     _review_vote_models.pop(session_id, None)
+    _meeting_models.pop(session_id, None)
+    _speech_request_models.pop(session_id, None)

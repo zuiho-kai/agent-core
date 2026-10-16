@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import NamedTuple, TypeVar
 
 from sqlalchemy import event, inspect
-from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,9 +27,11 @@ from openjiuwen.agent_teams.tools.database.config import DatabaseConfig, Databas
 from openjiuwen.agent_teams.tools.models import (
     TEAM_DYNAMIC_TABLE_PREFIXES,
     TEAM_STATIC_TABLES_TO_CLEAR,
+    _get_meeting_model,
     _get_message_model,
     _get_message_read_status_model,
     _get_review_vote_model,
+    _get_speech_request_model,
     _get_task_dependency_model,
     _get_task_model,
     _sanitize_session_id_for_table,
@@ -775,6 +778,8 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
     message_model = _get_message_model()
     read_status_model = _get_message_read_status_model()
     review_vote_model = _get_review_vote_model()
+    meeting_model = _get_meeting_model()
+    speech_request_model = _get_speech_request_model()
     conn = await session.connection()
     # Snapshot which migration-candidate tables already exist *before* create
     # runs. ``create(checkfirst=True)`` leaves a pre-existing table untouched,
@@ -782,13 +787,38 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
     # scheme and can be skipped without a single ``get_indexes`` PRAGMA call.
     candidates = _current_session_migration_tables()
     existing_before_create = await conn.run_sync(_snapshot_existing_tables, candidates)
-    for model in (task_model, dep_model, message_model, read_status_model, review_vote_model):
+    for model in (
+        task_model,
+        dep_model,
+        message_model,
+        read_status_model,
+        review_vote_model,
+        meeting_model,
+        speech_request_model,
+    ):
         await conn.run_sync(model.__table__.create, checkfirst=True)
     await conn.run_sync(_ensure_message_protocol_column)
     await conn.run_sync(_ensure_message_meta_column)
     await conn.run_sync(
         _ensure_dynamic_table_indexes, candidates, existing_before_create
     )
+
+
+async def create_meeting_tables(sessions: DbSessions, session_id: str) -> None:
+    """Ensure an explicitly scoped meeting's tables under the shared DDL/write lock."""
+    meeting_model = _get_meeting_model(session_id)
+    speech_request_model = _get_speech_request_model(session_id)
+
+    async def _create_once() -> bool:
+        async with sessions.write() as session:
+            conn = await session.connection()
+            for model in (meeting_model, speech_request_model):
+                await conn.run_sync(model.__table__.create, checkfirst=True)
+            await session.commit()
+        return True
+
+    if not await retry_on_locked(_create_once, on_locked_result=False, label="create_meeting_tables"):
+        raise RuntimeError("Failed to initialize meeting session tables")
 
 
 async def create_cur_session_tables(sessions: DbSessions) -> None:
@@ -874,9 +904,19 @@ async def drop_cur_session_tables(engine: AsyncEngine) -> None:
     message_model = _get_message_model()
     read_status_model = _get_message_read_status_model()
     review_vote_model = _get_review_vote_model()
+    meeting_model = _get_meeting_model()
+    speech_request_model = _get_speech_request_model()
 
     async with engine.begin() as conn:
-        for model in (task_model, dep_model, message_model, read_status_model, review_vote_model):
+        for model in (
+            task_model,
+            dep_model,
+            message_model,
+            read_status_model,
+            review_vote_model,
+            speech_request_model,
+            meeting_model,
+        ):
             await conn.run_sync(model.__table__.drop, checkfirst=True)
 
     team_logger.info("Dropped dynamic tables for session %s", session_id)

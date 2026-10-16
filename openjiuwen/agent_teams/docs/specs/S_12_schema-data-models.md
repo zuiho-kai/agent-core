@@ -14,7 +14,7 @@ does not.
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/agent_teams/schema/blueprint.py`、`openjiuwen/agent_teams/schema/deep_agent_spec.py`、`openjiuwen/agent_teams/schema/team.py`、`openjiuwen/agent_teams/schema/events.py`、`openjiuwen/agent_teams/schema/status.py`、`openjiuwen/agent_teams/schema/stream.py`、`openjiuwen/agent_teams/schema/task.py` |
-| 最近一次修订日期 | 2026-09-20 |
+| 最近一次修订日期 | 2026-10-16 |
 | 关联 feature | `F_05_lifecycle-finalize-relocation.md`（`MemberStatus.STOPPED` 新增）、`F_24_agent-time-awareness.md`（`TaskSummary.updated_at` 新增）、`F_38_team-teammate-worktree-isolation-agenttool.md`（`TeamRuntimeContext.worktree_path`）、`F_59_condition-named-task-state-machine-with-verify-gate.md`（条件命名 `TaskStatus` 状态机 + verify 闸）、`F_62_scheduled-dispatch-runtime-and-review-voting.md`（票表 + 轮数列 + `TASK_REVIEW_VOTE` + dispatch 能力上限）、`F_63_scheduler-message-templating-and-delivery-render.md`（消息表 `meta` 投递载荷列）、`F_65_runtime-idle-clock-stall-nudge.md`（`TeamAgentState.idle_since` 运行时 idle 时钟 + 两个停滞阈值 spec 字段）、`F_69_cwd-workspace-project-root-separation.md`（`DeepAgentSpec.cwd` / `project_root` 与 workspace 分离）、`F_78_steering-batch-quota-hook.md`（`TeamAgentSpec.steer_batch_size`）、`F_79_team-scoped-skill-library-and-visibility.md`（team 成员的 `skills` / `enable_skill_discovery` 落 build_spec 前被清空）。其余条目见 `docs/features/` |
 
 ## 范围 / 边界
@@ -41,6 +41,10 @@ does not.
 7. **任务返回模型与写路径结果包装**（`task.py`）：`TaskSummary` /
    `TaskDetail` / `TaskListResult` / `NewTaskSpec` 以及 `TaskOpResult` /
    `TaskCreateResult` / `GraphMutationResult`。
+8. **Meeting coordination values** (`meeting.py`): frozen `MeetingScope` and
+   `SpeechInterruption`, plus `SpeechRequestStatus`. These values describe the
+   database foundation in `S_30_meeting-speaking-contract.md`; they do not enable
+   meeting behavior or add runtime references to a Spec.
 
 不在本规约内：
 

@@ -41,7 +41,7 @@ SQLite 同一时刻只允许一个写者（数据库级锁）。DB 层围绕 SQL
   StaticPool 连接）和 PostgreSQL / MySQL 两者共用单引擎 —— `SqlEngines` 的读字段
   别名到写字段。`TeamDatabase.engine` / `session_local` 是**写者**引擎 + 工厂
   （也被 DDL helper 用到）；`read_engine` / `read_session_local` 是读者池。
-- **`DbSessions`（`database/engine.py`）** —— 四个 DAO 共享的一个 provider，
+- **`DbSessions`（`database/engine.py`）** —— 各 DAO 共享的一个 provider，
   暴露分别绑定到读者 / 写者工厂的 `read()` / `write()` async-context 访问器。
   `write()` 持有一把进程级 `asyncio.Lock`；`read()` 不持锁。这正是多成员负载下
   阻止 `QueuePool limit ... timed out` 耗尽的东西。写锁是**不可重入**的：当一个公开
@@ -97,6 +97,20 @@ PostgreSQL / MySQL 后端（`engine.py`），不要用 SQLite。
 具体落地示例：成员读取按 `member_exists`（判存在）/ `list_member_roster` 投影（名册视图）/
 `get_member`·`list_members` 全行（需要 `desc` 等重字段）三档取用，`send_message` 的收件人
 校验留在 `SendMessageTool`。细节见 `team.py` / `database/member_dao.py`。
+
+### Meeting queue database
+
+`TeamDatabase.meeting` (`database/meeting_dao.py`) uses the abstract models
+`TeamMeetingBase` / `TeamSpeechRequestBase` and the `_get_meeting_model()` /
+`_get_speech_request_model()` factories, matching tasks/messages. Their per-session
+tables are `team_meeting_<suffix>` / `team_speech_request_<suffix>` and participate
+in session bind/drop and team-delete cascades. Every operation uses an explicit
+session/team/meeting scope; factory resolution preserves the caller's context.
+Mutations acquire a database row/write lock before reading ownership; the local
+`DbSessions` lock alone does not protect against independent member processes.
+The DAO handles priority/FIFO, lease completion, cancellation, interruption barriers,
+and permanent close. It stores no outgoing message text and does not enable runtime
+meeting behavior. See `docs/specs/S_30_meeting-speaking-contract.md`.
 
 ## 工具目录与角色过滤
 
