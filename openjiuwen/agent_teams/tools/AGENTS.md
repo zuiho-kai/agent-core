@@ -109,8 +109,13 @@ session/team/meeting scope; factory resolution preserves the caller's context.
 Mutations acquire a database row/write lock before reading ownership; the local
 `DbSessions` lock alone does not protect against independent member processes.
 The DAO handles priority/FIFO, lease completion, cancellation, interruption barriers,
-and permanent close. It stores no outgoing message text and does not enable runtime
-meeting behavior. See `docs/specs/S_30_meeting-speaking-contract.md`.
+and permanent close. Each request stores `speech_text` and a required
+`source_message_id` referencing the normal session message table. The DAO does not
+read or validate source-message team/author; that belongs to the forthcoming wrapper
+(trusted callers supply the association until then). A foreign key restricts source
+deletion and a unique team/meeting/source key prevents duplicate audio requests.
+The normal message schema, transport, and read acknowledgements are unchanged.
+This does not enable runtime meeting behavior. See `docs/specs/S_30_meeting-speaking-contract.md`.
 
 ## 工具目录与角色过滤
 

@@ -14,7 +14,7 @@ import hashlib
 import json
 from typing import Dict, Optional, cast
 
-from sqlalchemy import BigInteger, Index, Table
+from sqlalchemy import BigInteger, ForeignKeyConstraint, Index, Table, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 from sqlmodel.main import SQLModelMetaclass
 
@@ -23,10 +23,10 @@ from openjiuwen.agent_teams.context import get_session_id
 TEAM_DYNAMIC_TABLE_PREFIXES = (
     "team_task_dependency_",
     "team_task_",
+    "team_speech_request_",
     "team_message_",
     "message_read_status_",
     "team_review_vote_",
-    "team_speech_request_",
     "team_meeting_",
 )
 TEAM_STATIC_TABLES_TO_CLEAR = (
@@ -125,7 +125,7 @@ class TeamMeetingBase(SQLModel):
 
 
 class TeamSpeechRequestBase(SQLModel):
-    """Base for speech request tables, one table per session; no outgoing message text."""
+    """Audio requests reference normal messages and own their spoken summaries."""
 
     __abstract__ = True
 
@@ -133,6 +133,8 @@ class TeamSpeechRequestBase(SQLModel):
     meeting_id: str = Field(primary_key=True)
     request_id: str = Field(primary_key=True)
     member_name: str
+    source_message_id: str = Field(nullable=False)
+    speech_text: str = Field(nullable=False, sa_type=Text)
     sequence: int = Field(sa_type=BigInteger)
     status: str = Field(default="queued")
     lease_token: str | None = Field(default=None)
@@ -408,7 +410,15 @@ def _get_speech_request_model(session_id: str | None = None) -> type[TeamSpeechR
         table_name = f"team_speech_request_{suffix}"
         attrs = {
             "__tablename__": table_name,
-            "__table_args__": (Index(f"ix_{table_name}_pending", "team_name", "meeting_id", "status", "sequence"),),
+            "__table_args__": (
+                Index(f"ix_{table_name}_pending", "team_name", "meeting_id", "status", "sequence"),
+                UniqueConstraint("team_name", "meeting_id", "source_message_id"),
+                ForeignKeyConstraint(
+                    ["source_message_id"],
+                    [f"{_get_message_model(session_id).__tablename__}.message_id"],
+                    ondelete="RESTRICT",
+                ),
+            ),
         }
         model_cls = SQLModelMetaclass(f"TeamSpeechRequest_{suffix}", (TeamSpeechRequestBase,), attrs, table=True)
         _speech_request_models[session_id] = cast(type[TeamSpeechRequestBase], model_cls)
@@ -472,9 +482,9 @@ def _get_task_dependency_model() -> type[TeamTaskDependencyBase]:
     return _task_dependency_models[session_id]
 
 
-def _get_message_model() -> type[TeamMessageBase]:
-    """Get or create dynamic message model for current session"""
-    session_id = get_session_id()
+def _get_message_model(session_id: str | None = None) -> type[TeamMessageBase]:
+    """Get or create the normal message model without rebinding session context."""
+    session_id = get_session_id() if session_id is None else session_id
     if session_id not in _message_models:
         suffix = _sanitize_session_id_for_table(session_id)
         class_name = f"TeamMessage_{suffix}"

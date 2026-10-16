@@ -1,10 +1,10 @@
-# Meeting Speaking Contract — Draft v0.1
+# Meeting Speaking Contract — Draft v0.2
 
 ## Status and scope
 
 | Item | Value |
 |---|---|
-| Status | Database foundation implemented; runtime/audio integration remains proposed |
+| Status | Database queue and strict message linkage implemented; wrapper/audio integration remains proposed |
 | Date | 2026-10-16 |
 | Scope | PR2: meeting coordination in `agent-core` |
 | Requirements | [agent-core #1951](https://github.com/openJiuwen-ai/agent-core/issues/1951), [JiuwenSwarm #8260](https://github.com/openJiuwen-ai/jiuwenswarm/issues/8260) |
@@ -12,7 +12,7 @@
 
 **Required** denotes behavior specified by the issues. **Proposed** denotes a design choice to review together. Names and signatures below are illustrative, not existing APIs.
 
-The initial scope is one human meeting one Team in a group conversation. Audio capture, VAD, ASR, meaningful-interruption classification, recipient routing, TTS, and playback belong to JiuwenSwarm. PR2 provides speaking ownership, outgoing-message coordination, interruption APIs, and spoken-summary generation.
+The initial scope is one human meeting one Team in a group conversation. Audio capture, VAD, ASR, meaningful-interruption classification, TTS, and playback belong to JiuwenSwarm. Agents supply full text and a spoken summary together. PR2 provides audio ownership, interruption primitives, and a strict reference from each audio request to its normal message. Existing team routing and text delivery remain unchanged.
 
 ## 1. Ownership and boundaries
 
@@ -21,12 +21,12 @@ The initial scope is one human meeting one Team in a group conversation. Audio c
 | Determine human intent, recipient, and whether speech is a meaningful interruption | JiuwenSwarm |
 | Order agents waiting to speak; grant and revoke ownership | `agent-core` |
 | Publish the original complete text through existing delivery paths | `agent-core` |
-| Generate a short spoken version with the originating agent's model and context | `agent-core` |
+| Supply a short spoken version alongside the full message | Originating agent; generation integration remains proposed |
 | Choose the configured voice, synthesize audio, play and stop audio | JiuwenSwarm |
 | Report playback completion, failure, or cancellation | JiuwenSwarm |
 | Decide whether a sub-agent should be interrupted | Leader, through its meeting tool |
 
-**Required:** reuse existing Team messaging and group-chat mechanisms. Meeting coordination must not create a second message transport. #1905's incoming mailbox hook does not by itself gate outgoing publication; the integration must cover that boundary explicitly.
+**Required:** reuse existing Team routing, messaging, and group-chat mechanisms. Meeting coordination must not create a second text transport or change the normal message schema. The audio queue does not gate outgoing text publication.
 
 **Required:** meetings are opt-in. Disabled meetings preserve current tool availability, message delivery, output streaming, and model-call behavior.
 
@@ -35,7 +35,7 @@ The initial scope is one human meeting one Team in a group conversation. Audio c
 **Required**
 
 1. There is at most one speaking owner per meeting.
-2. Human-facing replies, agent-to-agent messages, and broadcasts must acquire ownership before their complete text is published.
+2. Full messages use existing delivery paths immediately; their spoken versions must acquire ownership before playback.
 3. Normal release happens after text publication and audio playback have completed.
 4. Waiting to speak must not prevent an agent from continuing independent thinking or tool work.
 5. Humans bypass the agent queue.
@@ -45,11 +45,11 @@ The initial scope is one human meeting one Team in a group conversation. Audio c
 **Proposed**
 
 - Scope ownership by `(session_id, team_name, meeting_id)`. A new meeting instance gets a new `meeting_id`, even in an existing conversation.
-- Initially, one queued speech request corresponds to one finalized outgoing message and its spoken version. Multicast is one logical request, with several recipients.
+- One queued speech request references one persisted normal message and stores its spoken version. Multicast correlation beyond one persisted source row remains future wrapper work.
 - Every request has a stable `request_id`; every grant has an opaque `lease_token`. Neither is just a member name.
 - Playback callbacks must match the meeting instance and lease token. Duplicate and stale callbacks are harmless and cannot release a successor.
 - Internal lifecycle events, approvals, and system notifications bypass speaking coordination. Their existing delivery must continue while an agent is speaking.
-- Partial model output must not escape as the visible reply before ownership. The SDK must gate the human-facing output path as well as messaging tools.
+- Existing output streaming continues independently of audio ownership.
 
 ## 3. Queue policy
 
@@ -70,21 +70,20 @@ Example: B is speaking. Requests arrive from C, addressed agent A, and the Leade
 The proposed normal lifecycle is:
 
 ```text
-QUEUED -> GRANTED -> TEXT_PUBLISHED -> SPEECH_READY -> PLAYING -> COMPLETED
+NORMAL_MESSAGE_PUBLISHED -> QUEUED -> GRANTED -> PLAYING -> COMPLETED
 ```
 
-- **QUEUED:** the SDK accepted the outgoing operation; it has not sent the text yet.
+- **NORMAL_MESSAGE_PUBLISHED:** full text is committed and delivered through the normal communication path.
+- **QUEUED:** the SDK accepted an audio request referencing that message, with its agent-produced `speech_text`.
 - **GRANTED:** this request holds speaking ownership.
-- **TEXT_PUBLISHED:** the existing delivery path committed/published the full text.
-- **SPEECH_READY:** the SDK supplies the original text, spoken version, author, message identity, and lease token to the application.
 - **PLAYING:** the application is synthesizing/playing the spoken version under that token.
 - **COMPLETED:** the application acknowledges that playback has finished; the SDK releases ownership.
 
-**Proposed:** sending while queued returns a clearly marked pending receipt, rather than claiming the message was delivered. The actual send outcome becomes available through the existing background-operation/completion mechanism. Exact tool-result compatibility needs review before implementation.
+Normal message receipts retain their existing delivery meaning. Audio admission is a separate result carrying its request ID and source message ID; a queued audio request does not mean the text is pending. The future wrapper must expose both results without acknowledging an agent's mailbox.
 
 The Leader must be able to inspect the current speaker's full text while its audio plays. Otherwise its interruption tool cannot make the judgment required by the RFC.
 
-Text publication and summary generation are ordered: publish the full text first, then generate the spoken version. Summary generation must not modify the text message or the agent's conversation history.
+The agent supplies full text and summary together. Persist the full text through normal storage, then admit the summary with its source reference. The request stores no full-text copy and does not alter the original message or conversation history.
 
 ## 5. Human and Leader interruptions
 
@@ -109,19 +108,14 @@ A Leader tool call should target the observed lease token. If that speaker has a
 
 ## 6. Spoken-summary contract
 
-**Required**
+The originating agent supplies a short conversational `speech_text` alongside its full
+message. The request DAO persists this supplied text and performs no model call.
+JiuwenSwarm resolves the original by `source_message_id`, exposes both representations,
+and performs TTS/playback. Agent-generation and wrapper integration remain proposed.
 
-- Use the originating agent's same model and context for one additional request.
-- Produce a short conversational summary: conclusion first; do not read code, tables, or links aloud.
-- Deliver the full text and spoken version to the application; the application performs TTS.
-
-**Proposed**
-
-- Preserve the source language and material conclusions. Add no new decisions or tool actions.
-- Use a copied context snapshot associated with the outgoing message and the same effective model configuration. Do not recursively run the agent's task loop or append this auxiliary request to its history.
-- Complete tool-call/result pairs must be maintained in the summary request; do not invent tool results to make an incomplete context valid. The precise snapshot boundary is an open decision below.
-- Put a finite timeout on summary generation. On failure, retain the full text, report that speech could not be generated, and release ownership. Do not silently read the entire original message or switch models.
-- External runtimes without access to the required model/context need an explicit adapter contract; their support is not assumed.
+The summary should preserve the language and conclusions, without reading code, tables,
+or links aloud. A failed summary must not retract a published message. The earlier
+proposal for a separate agent-core same-model/context summarization call is superseded.
 
 ## 7. Illustrative SDK operations and events
 
@@ -129,18 +123,18 @@ These describe semantics rather than final Python names or signatures.
 
 | Operation | Contract |
 |---|---|
-| `request_speech(...) -> request_id` | Register one outgoing operation and return promptly; derive author and priority from trusted runtime state. |
+| `request_speech(...) -> request_id` | Register audio for a committed source message and supplied summary; derive priority from trusted runtime state. |
 | `wait_for_grant(request_id) -> lease` | Internal/background wait; cancelling the wait cancels the corresponding queued request. |
-| `cancel_request(request_id)` | Cancel an unsent operation; never retract a published message. |
+| `cancel_request(request_id)` | Cancel queued audio; never retract a published message. |
 | `get_speaker() -> lease or None` | Return current ownership and the published message identity, when available. |
 | `complete_playback(lease_token, outcome)` | Release only the matching current lease; duplicate/stale completion is a no-op. |
 | `interrupt_speech(reason, expected_token?) -> interruption_id` | Trusted application/authorized Leader revokes ownership and starts the proposed interruption barrier. |
 | `resume_after_interruption(interruption_id)` | Application confirms old audio is stopped and, for human interruptions, human input has been admitted. |
-| `close_meeting(meeting_id)` | Revoke ownership, cancel pending sends/summary work, stop audio through the application, and reject late callbacks. |
+| `close_meeting(meeting_id)` | Revoke ownership, cancel pending audio, stop playback through the application, and reject late callbacks. |
 
 Proposed application notifications:
 
-- `speech_ready`: meeting/request/message identities, lease token, member, recipients/message kind, full text, and spoken summary.
+- `speech_ready`: meeting/request/source-message identities, lease token, member, and spoken summary; full text is resolved from normal storage.
 - `speech_interrupted`: revoked token, interruption identity, reason, and initiating actor.
 - `speech_failed`: request/token, failure phase, whether text was already published, and actionable error information.
 
@@ -153,11 +147,11 @@ Exact event names and transport mapping should reuse the existing event infrastr
 - Queue and ownership changes must be atomic across supported member processes. A process-local lock is insufficient.
 - Shared team-database state is the chosen authority for the database foundation (§11). Existing message-bus notifications remain a runtime integration step.
 - Never hold a database transaction while waiting for a model, a tool, another speaker, or audio playback.
-- A failed text publication releases ownership and reports failure. A summary/TTS failure retains published text and also releases through the failure lifecycle.
+- Failed text publication cannot admit audio without a committed source. A TTS failure retains published text and releases through the failure lifecycle.
 - Releasing after synthesis/playback failure requires the application to confirm any active audio has stopped.
 - A disconnected application or dead owner must not leave an invisible permanent lock. Fault-recovery timeouts initiate stop/revocation; they must not grant a successor while old playback could still continue.
 - Fault-recovery deadlines are not a normal maximum speech duration. Automatic time-based speech interruption is deferred by the RFC.
-- Closing a meeting cancels pending outgoing operations and auxiliary summary requests, while preserving published text and unrelated agent work.
+- Closing a meeting cancels pending audio requests while preserving text delivery and unrelated agent work.
 - Meeting state must remain isolated across teams, sessions, and meeting restarts. Recovery of a persisted conversation must not replay old audio automatically.
 
 ## 9. Acceptance scenarios
@@ -166,12 +160,12 @@ Exact event names and transport mapping should reuse the existing event infrastr
 2. Leader, addressed-member, and ordinary-member queue priority works; ties preserve arrival order.
 3. Normal priority never preempts the current speaker.
 4. Waiting to speak does not block unrelated agent work.
-5. Replies, A2A messages, broadcasts, and multicast all pass through the speaking gate; internal control traffic does not.
-6. Text is published once through its existing path before its spoken version is offered for playback.
+5. Normal routing, text delivery, and internal control traffic continue independently of the audio queue.
+6. Each audio request references a committed source message and its immutable spoken summary; text is delivered through its existing path.
 7. Playback completion releases the matching lease; an old callback cannot release the next turn.
 8. Human interruption stops speech, preserves text, admits the human message first, and then reopens the queue.
 9. Only the Leader can invoke the agent-facing interruption tool; a stale target cannot interrupt a successor.
-10. Late summary/synthesis results after interruption are discarded.
+10. Late synthesis results after interruption are discarded.
 11. Queue cancellation, summary failure, TTS failure, disconnect, and meeting shutdown leave no permanent ownership or unhandled background tasks.
 12. Disabled meetings preserve current behavior, toolsets, and model-call counts.
 
@@ -183,13 +177,13 @@ Exact event names and transport mapping should reuse the existing event infrastr
 | Meaning of addressed priority | Latest admitted human routing result; update pending priorities | Keep priority fixed at queue admission, or bind it to the originating human turn. |
 | Cross-process authority | Shared team database plus existing bus notifications | Leader-owned coordinator; requires request/grant protocol and failover design. |
 | Interruption handoff | Revoke immediately, reopen after stop/input acknowledgement | Release and grant immediately; application must independently prevent overlapping playback. |
-| Queued tool behavior | Explicit pending receipt, eventual real send result | Block the tool call until publication; simpler, but may stall agent work. |
-| Summary snapshot | Immutable context associated with finalized outgoing message | Decide the exact valid boundary for message-tool calls and parallel tools. |
-| Initial runtime support | Native agents first; explicit capability check | Include external CLI members only after defining their same-model/context adapter. |
+| Queued tool behavior | Normal text receipts remain unchanged; audio has a separate request result | Exact wrapper API remains proposed. |
+| Summary generation | Agent supplies text and summary together; queue stores the summary | Agent-generation integration is separate from the database change. |
+| Initial runtime support | Reuse existing team/group-chat paths | Finalized streamed replies need a persisted source identity before audio admission. |
 | Recovery policy and limits | Explicit failure/stop handoff, no silent audio replay | Define concrete timeouts, pending-operation recovery, and playback-owner authority. |
 
 The first implementation step is the shared queue database, explicitly requested on 2026-10-16.
-The remaining runtime, delivery, summary, and application contracts remain proposals.
+The remaining wrapper, agent-generation, and application contracts remain proposals.
 
 ## 11. Database foundation
 
@@ -205,8 +199,8 @@ Meeting row keys are `(team_name, meeting_id)`; request keys add `request_id`.
 Meeting IDs cannot be reopened after close. A new meeting requires a new ID.
 
 The tables participate in normal session schema creation, model caching, and session
-table drop/cleanup. Explicit meeting creation can initialize its session's two tables
-without changing the caller's bound session. Team deletion cascades through the existing
+table drop/cleanup. Explicit meeting creation ensures both meeting tables and their
+normal-message parent table without changing the caller's bound session. Team deletion cascades through the existing
 `team_info` foreign-key convention.
 
 All mutations first update the meeting row, acquiring a database write/row lock before
@@ -218,7 +212,7 @@ An increasing per-meeting sequence defines FIFO, independent of clock resolution
 non-human members and has no priority argument. `set_addressed_members` replaces the trusted
 routing result. `list_pending` and `grant_next` rank pending requests using the latest result,
 then sequence. Priority changes never revoke an owner. Reusing a request ID returns the
-existing request for that author, including terminal requests, without re-enqueueing it.
+existing request for that author/source/summary, including terminal requests, without re-enqueueing it.
 
 `grant_next` returns a request with a fresh opaque lease token, or `None` when owned,
 interrupted, closed, or empty. `complete_playback` releases only a matching current token.
@@ -228,7 +222,38 @@ and persists an interruption ID; no successor can be granted until
 `resume_after_interruption` acknowledges that exact ID. `close_meeting` cancels pending
 requests and revokes ownership permanently. Terminal requests remain as deduplication records.
 
-This layer stores coordination metadata only. Full text, delivery, speech generation,
-audio stop acknowledgement, leader-tool authorization, recovery deadlines, and bus
-notifications belong to the forthcoming coordinator. Persisted leases are never automatically
-replayed or expired by this DAO. Session release and runtime cleanup remove the scoped rows.
+This layer stores coordination metadata, the source message reference, and its spoken
+summary. Full text stays in normal message storage. Audio stop acknowledgement,
+leader-tool authorization, recovery deadlines, and bus notifications remain integration
+work. Persisted leases are never automatically replayed or expired by this DAO.
+Session release and runtime cleanup remove the scoped rows.
+
+## 12. Strict audio-to-message linkage
+
+`enqueue(scope, request_id, member_name, *, source_message_id, speech_text)` requires
+an already committed normal message in the scope's session and a nonblank summary.
+Its admission transaction locks the meeting and inserts the reference and summary
+together without querying the source message. A per-session foreign
+key restricts deletion of referenced messages. One source message has at most one
+request per meeting, enforced by a database unique constraint. A repeated request ID
+must match author, source message ID, and exact summary; conflicts raise `ValueError`
+without changing sequence, payload, or ownership. Terminal records retain these links.
+Source-message team/author validation belongs to the forthcoming wrapper. Until then,
+the trusted caller must supply the correct association. Missing/deleted source messages
+fail through the foreign key with `IntegrityError`; the transaction rolls back.
+The foreign key arbitrates source deletion against admission. Constraint enforcement can
+still acquire internal locks; this does not promise deadlock-free arbitrary transactions.
+
+Normal message storage and transport are unchanged. Consumers can combine the normal
+message with the request using explicit scope and `source_message_id`; retrieving
+audio work must not acknowledge an agent's mailbox. The queue stores no full-text copy.
+Creating a normal message and admitting audio remain separate commits; applications
+retry admission with stable IDs. This schema change does not implement a wrapper or
+claim atomic message-plus-request publication.
+
+Empty legacy request tables are rebuilt during schema setup, with an INFO migration
+log. The ensure helper ignores absent/current tables and detects the prototype schema
+by its missing source/summary columns. Constraints are declared by the model. A populated
+legacy table logs its table name and reason at ERROR and raises
+`AGENT_TEAM_STATE_INVALID`; it never invents source links or discards rows. Session
+teardown drops referencing requests before messages.

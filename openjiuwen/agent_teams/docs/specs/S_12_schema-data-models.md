@@ -45,6 +45,9 @@ does not.
    `SpeechInterruption`, plus `SpeechRequestStatus`. These values describe the
    database foundation in `S_30_meeting-speaking-contract.md`; they do not enable
    meeting behavior or add runtime references to a Spec.
+   Speech-request rows store `source_message_id` and `speech_text`; a per-session
+   foreign key links to normal messages, with one request per source per meeting.
+   The normal message schema is unchanged (F_118).
 
 不在本规约内：
 

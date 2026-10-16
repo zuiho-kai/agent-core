@@ -10,18 +10,23 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import inspect
+from sqlalchemy import delete, insert, inspect
+from sqlalchemy.exc import IntegrityError
 
 from openjiuwen.agent_teams.context import get_session_id, reset_session_id, set_session_id
 from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechRequestStatus
 from openjiuwen.agent_teams.tools.database import DatabaseConfig, TeamDatabase
+from openjiuwen.agent_teams.tools.database.engine import _ensure_speech_request_schema
 from openjiuwen.agent_teams.tools.models import (
     TeamMeetingBase,
     TeamSpeechRequestBase,
     _get_meeting_model,
+    _get_message_model,
     _get_speech_request_model,
     _sanitize_session_id_for_table,
 )
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import ValidationError
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.level1]
 
@@ -41,6 +46,30 @@ async def _seed_team(db: TeamDatabase, team_name: str = "team") -> None:
         )
 
 
+async def _enqueue(db: TeamDatabase, scope: MeetingScope, request_id: str, member_name: str):
+    """Create a normal message, then admit its audio through the production DAO."""
+    source_message_id = f"message:{scope.team_name}:{member_name}:{request_id}"
+    token = set_session_id(scope.session_id)
+    try:
+        await db.message.create_message(
+            source_message_id,
+            scope.team_name,
+            member_name,
+            f"Full text for {request_id}",
+            to_member_name="user",
+            inline_content=True,
+        )
+    finally:
+        reset_session_id(token)
+    return await db.meeting.enqueue(
+        scope,
+        request_id,
+        member_name,
+        source_message_id=source_message_id,
+        speech_text=f"Spoken {request_id}",
+    )
+
+
 @pytest_asyncio.fixture
 async def db(tmp_path: Path):
     database = TeamDatabase(DatabaseConfig(connection_string=str(tmp_path / "meeting.db")))
@@ -56,13 +85,13 @@ async def db(tmp_path: Path):
 async def test_priority_fifo_and_no_preemption(db: TeamDatabase) -> None:
     """Latest routing ranks pending requests without preempting the current lease."""
     dao = db.meeting
-    await dao.enqueue(SCOPE, "current", "b")
+    await _enqueue(db, SCOPE, "current", "b")
     current = await dao.grant_next(SCOPE)
-    await dao.enqueue(SCOPE, "b1", "b")
-    await dao.enqueue(SCOPE, "a1", "a")
-    await dao.enqueue(SCOPE, "b2", "b")
-    await dao.enqueue(SCOPE, "leader", "captain")
-    await dao.enqueue(SCOPE, "a2", "a")
+    await _enqueue(db, SCOPE, "b1", "b")
+    await _enqueue(db, SCOPE, "a1", "a")
+    await _enqueue(db, SCOPE, "b2", "b")
+    await _enqueue(db, SCOPE, "leader", "captain")
+    await _enqueue(db, SCOPE, "a2", "a")
     await dao.set_addressed_members(SCOPE, ["a"])
     assert await dao.grant_next(SCOPE) is None
     assert (await dao.get_meeting(SCOPE)).lease_token == current.lease_token
@@ -81,28 +110,28 @@ async def test_priority_fifo_and_no_preemption(db: TeamDatabase) -> None:
 
 async def test_deduplication_and_queued_only_cancellation(db: TeamDatabase) -> None:
     dao = db.meeting
-    original = await dao.enqueue(SCOPE, "one", "a")
-    duplicate = await dao.enqueue(SCOPE, "one", "a")
+    original = await _enqueue(db, SCOPE, "one", "a")
+    duplicate = await _enqueue(db, SCOPE, "one", "a")
     assert original.sequence == duplicate.sequence
     with pytest.raises(ValueError, match="another member"):
-        await dao.enqueue(SCOPE, "one", "b")
+        await _enqueue(db, SCOPE, "one", "b")
     assert await dao.cancel_request(SCOPE, "one")
     assert not await dao.cancel_request(SCOPE, "one")
     assert not await dao.cancel_request(SCOPE, "missing")
-    assert (await dao.enqueue(SCOPE, "one", "a")).status == SpeechRequestStatus.CANCELLED
-    await dao.enqueue(SCOPE, "two", "a")
+    assert (await _enqueue(db, SCOPE, "one", "a")).status == SpeechRequestStatus.CANCELLED
+    await _enqueue(db, SCOPE, "two", "a")
     granted = await dao.grant_next(SCOPE)
     assert granted.request_id == "two"
     assert not await dao.cancel_request(SCOPE, "two")
     assert await dao.complete_playback(SCOPE, granted.lease_token)
-    assert (await dao.enqueue(SCOPE, "two", "a")).status == SpeechRequestStatus.COMPLETED
+    assert (await _enqueue(db, SCOPE, "two", "a")).status == SpeechRequestStatus.COMPLETED
     assert await dao.grant_next(SCOPE) is None
 
 
 async def test_stale_callback_cannot_release_successor(db: TeamDatabase) -> None:
     dao = db.meeting
-    await dao.enqueue(SCOPE, "first", "a")
-    await dao.enqueue(SCOPE, "next", "a")
+    await _enqueue(db, SCOPE, "first", "a")
+    await _enqueue(db, SCOPE, "next", "a")
     first = await dao.grant_next(SCOPE)
     assert not await dao.complete_playback(SCOPE, "wrong")
     assert not await dao.complete_playback(SCOPE, "")
@@ -117,8 +146,8 @@ async def test_stale_callback_cannot_release_successor(db: TeamDatabase) -> None
 
 async def test_interruption_barrier_and_stale_acknowledgements(db: TeamDatabase) -> None:
     dao = db.meeting
-    await dao.enqueue(SCOPE, "one", "a")
-    await dao.enqueue(SCOPE, "two", "b")
+    await _enqueue(db, SCOPE, "one", "a")
+    await _enqueue(db, SCOPE, "two", "b")
     granted = await dao.grant_next(SCOPE)
     interrupted = await dao.interrupt_speech(SCOPE, expected_token=granted.lease_token)
     assert interrupted.request_id == "one"
@@ -139,7 +168,7 @@ async def test_interruption_barrier_and_stale_acknowledgements(db: TeamDatabase)
 async def test_human_admission_barrier_when_idle(db: TeamDatabase) -> None:
     interruption = await db.meeting.interrupt_speech(SCOPE)
     assert interruption.lease_token is None
-    await db.meeting.enqueue(SCOPE, "pending", "a")
+    await _enqueue(db, SCOPE, "pending", "a")
     assert await db.meeting.grant_next(SCOPE) is None
     assert await db.meeting.resume_after_interruption(SCOPE, interruption.interruption_id)
     assert (await db.meeting.grant_next(SCOPE)).request_id == "pending"
@@ -147,8 +176,8 @@ async def test_human_admission_barrier_when_idle(db: TeamDatabase) -> None:
 
 async def test_close_is_permanent_and_late_callbacks_are_harmless(db: TeamDatabase) -> None:
     dao = db.meeting
-    await dao.enqueue(SCOPE, "one", "a")
-    await dao.enqueue(SCOPE, "two", "b")
+    await _enqueue(db, SCOPE, "one", "a")
+    await _enqueue(db, SCOPE, "two", "b")
     granted = await dao.grant_next(SCOPE)
     assert await dao.close_meeting(SCOPE)
     assert not await dao.close_meeting(SCOPE)
@@ -161,13 +190,13 @@ async def test_close_is_permanent_and_late_callbacks_are_harmless(db: TeamDataba
     assert await dao.interrupt_speech(SCOPE) is None
     assert await dao.grant_next(SCOPE) is None
     with pytest.raises(ValueError, match="closed"):
-        await dao.enqueue(SCOPE, "late", "a")
+        await _enqueue(db, SCOPE, "late", "a")
 
 
 @pytest.mark.parametrize("member", ["human", "unknown", "user"])
 async def test_only_registered_agents_can_queue(db: TeamDatabase, member: str) -> None:
     with pytest.raises(ValueError, match="registered agent"):
-        await db.meeting.enqueue(SCOPE, "bad", member)
+        await _enqueue(db, SCOPE, "bad", member)
     assert await db.meeting.list_pending(SCOPE) == []
 
 
@@ -175,7 +204,7 @@ async def test_invalid_scope_and_missing_meeting(db: TeamDatabase) -> None:
     with pytest.raises(ValueError, match="non-empty"):
         MeetingScope("", "team", "meeting")
     with pytest.raises(ValueError, match="non-empty"):
-        await db.meeting.enqueue(SCOPE, " ", "a")
+        await _enqueue(db, SCOPE, " ", "a")
     missing = MeetingScope("session", "team", "missing")
     with pytest.raises(ValueError, match="does not exist"):
         await db.meeting.grant_next(missing)
@@ -195,7 +224,7 @@ async def test_scope_isolation(db: TeamDatabase) -> None:
     tokens = []
     for scope in scopes:
         await db.meeting.create_meeting(scope)
-        await db.meeting.enqueue(scope, "same-id", "a")
+        await _enqueue(db, scope, "same-id", "a")
         tokens.append((await db.meeting.grant_next(scope)).lease_token)
     assert len(set(tokens)) == len(scopes)
     for scope in scopes[1:]:
@@ -248,7 +277,7 @@ async def test_session_bind_creates_and_drops_meeting_tables(db: TeamDatabase) -
         assert _get_meeting_model() is meeting_model
         scope = MeetingScope("meeting-bind-session", "team", "meeting")
         await db.meeting.create_meeting(scope)
-        await db.meeting.enqueue(scope, "bound", "a")
+        await _enqueue(db, scope, "bound", "a")
         assert (await db.meeting.grant_next(scope)).request_id == "bound"
         assert get_session_id() == "meeting-bind-session"
     finally:
@@ -260,13 +289,13 @@ async def test_independent_engines_admit_once_and_grant_one_owner(db: TeamDataba
     await other.initialize()
     try:
         admissions = await asyncio.gather(
-            db.meeting.enqueue(SCOPE, "duplicate", "a"),
-            other.meeting.enqueue(SCOPE, "duplicate", "a"),
+            _enqueue(db, SCOPE, "duplicate", "a"),
+            _enqueue(other, SCOPE, "duplicate", "a"),
         )
         assert admissions[0].sequence == admissions[1].sequence
         await asyncio.gather(
-            db.meeting.enqueue(SCOPE, "two", "b"),
-            other.meeting.enqueue(SCOPE, "three", "a"),
+            _enqueue(db, SCOPE, "two", "b"),
+            _enqueue(other, SCOPE, "three", "a"),
         )
         pending = await db.meeting.list_pending(SCOPE)
         assert len(pending) == 3
@@ -279,7 +308,7 @@ async def test_independent_engines_admit_once_and_grant_one_owner(db: TeamDataba
 
 
 async def test_reopen_preserves_ownership_without_replay(db: TeamDatabase) -> None:
-    await db.meeting.enqueue(SCOPE, "one", "a")
+    await _enqueue(db, SCOPE, "one", "a")
     granted = await db.meeting.grant_next(SCOPE)
     await db.close()
     await db.initialize()
@@ -296,7 +325,7 @@ async def test_independent_engines_create_same_session_meeting(db: TeamDatabase)
     try:
         created = await asyncio.gather(db.meeting.create_meeting(scope), other.meeting.create_meeting(scope))
         assert all(meeting.meeting_id == "meeting" for meeting in created)
-        await db.meeting.enqueue(scope, "one", "a")
+        await _enqueue(db, scope, "one", "a")
         granted = await other.meeting.grant_next(scope)
         assert granted.request_id == "one"
         assert (await db.meeting.get_meeting(scope)).lease_token == granted.lease_token
@@ -307,8 +336,8 @@ async def test_independent_engines_create_same_session_meeting(db: TeamDatabase)
 async def test_session_release_and_team_deletion_cleanup(db: TeamDatabase) -> None:
     other_session = MeetingScope("other", "team", "meeting")
     await db.meeting.create_meeting(other_session)
-    await db.meeting.enqueue(SCOPE, "one", "a")
-    await db.meeting.enqueue(other_session, "two", "b")
+    await _enqueue(db, SCOPE, "one", "a")
+    await _enqueue(db, other_session, "two", "b")
     await db.drop_session_tables_by_id(SCOPE.session_id)
     assert await db.meeting.get_meeting(SCOPE) is None
     assert await db.meeting.get_request(SCOPE, "one") is None
@@ -322,7 +351,7 @@ async def test_session_release_and_team_deletion_cleanup(db: TeamDatabase) -> No
 
 
 async def test_global_cleanup_removes_coordination_state(db: TeamDatabase) -> None:
-    await db.meeting.enqueue(SCOPE, "one", "a")
+    await _enqueue(db, SCOPE, "one", "a")
     await db.meeting.grant_next(SCOPE)
     dropped, cleared = await db.cleanup_all_runtime_state()
     assert _get_meeting_model(SCOPE.session_id).__tablename__ in dropped
@@ -341,13 +370,287 @@ async def test_additive_schema_setup_preserves_existing_team(db: TeamDatabase) -
     await db.initialize()
     assert (await db.team.get_team("team")).leader_member_name == "captain"
     await db.meeting.create_meeting(SCOPE)
-    assert (await db.meeting.enqueue(SCOPE, "new", "a")).sequence == 1
+    assert (await _enqueue(db, SCOPE, "new", "a")).sequence == 1
     async with db.engine.begin() as conn:
         names = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
     assert _get_meeting_model(SCOPE.session_id).__tablename__ in names
     assert _get_speech_request_model(SCOPE.session_id).__tablename__ in names
     assert "team_meeting" not in names
     assert "team_speech_request" not in names
+
+
+async def test_request_preserves_message_link_and_summary(db: TeamDatabase) -> None:
+    token = set_session_id("unrelated-context")
+    try:
+        request = await _enqueue(db, SCOPE, "linked", "a")
+        assert get_session_id() == "unrelated-context"
+        assert request.source_message_id == "message:team:a:linked"
+        assert request.speech_text == "Spoken linked"
+        assert (await db.meeting.grant_next(SCOPE)).source_message_id == request.source_message_id
+        persisted = await db.meeting.get_request(SCOPE, "linked")
+        assert persisted.speech_text == request.speech_text
+        async with db._sessions.read() as session:
+            original = await session.get(_get_message_model(SCOPE.session_id), request.source_message_id)
+        assert original.content == "Full text for linked"
+        assert not original.is_read
+        assert "speech_text" not in _get_message_model(SCOPE.session_id).__table__.columns
+    finally:
+        reset_session_id(token)
+
+
+@pytest.mark.parametrize("source,summary", [("", "spoken"), ("source", " ")])
+async def test_audio_payload_requires_source_and_summary(db: TeamDatabase, source: str, summary: str) -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        await db.meeting.enqueue(SCOPE, "invalid", "a", source_message_id=source, speech_text=summary)
+    assert (await db.meeting.get_meeting(SCOPE)).next_sequence == 0
+
+
+async def test_foreign_key_rejects_missing_and_cross_session_sources(db: TeamDatabase) -> None:
+    other_session = MeetingScope("isolated-source-session", "team", "meeting")
+    await db.meeting.create_meeting(other_session)
+    source = await _enqueue(db, other_session, "source", "a")
+    for request_id, source_id in (("missing", "missing"), ("wrong-session", source.source_message_id)):
+        with pytest.raises(IntegrityError):
+            await db.meeting.enqueue(
+                SCOPE,
+                request_id,
+                "a",
+                source_message_id=source_id,
+                speech_text="spoken",
+            )
+        assert await db.meeting.get_request(SCOPE, request_id) is None
+        assert (await db.meeting.get_meeting(SCOPE)).next_sequence == 0
+    assert await db.meeting.list_pending(SCOPE) == []
+
+
+async def test_retry_cannot_change_source_or_summary_even_after_completion(db: TeamDatabase) -> None:
+    first = await _enqueue(db, SCOPE, "first", "a")
+    second = await _enqueue(db, SCOPE, "second", "a")
+    for source, summary in (
+        (second.source_message_id, first.speech_text),
+        (first.source_message_id, "replacement summary"),
+    ):
+        with pytest.raises(ValueError, match="different source message or speech text"):
+            await db.meeting.enqueue(SCOPE, "first", "a", source_message_id=source, speech_text=summary)
+    grant = await db.meeting.grant_next(SCOPE)
+    await db.meeting.complete_playback(SCOPE, grant.lease_token)
+    with pytest.raises(ValueError, match="different source message or speech text"):
+        await db.meeting.enqueue(
+            SCOPE,
+            "first",
+            "a",
+            source_message_id=first.source_message_id,
+            speech_text="changed after playback",
+        )
+    assert (await db.meeting.get_request(SCOPE, "first")).speech_text == first.speech_text
+    assert (await db.meeting.get_meeting(SCOPE)).next_sequence == 2
+
+
+async def test_source_message_cannot_enqueue_twice_under_different_ids(db: TeamDatabase) -> None:
+    original = await _enqueue(db, SCOPE, "original", "a")
+    with pytest.raises(ValueError, match="already has a speech request"):
+        await db.meeting.enqueue(
+            SCOPE,
+            "duplicate",
+            "a",
+            source_message_id=original.source_message_id,
+            speech_text=original.speech_text,
+        )
+    # A new meeting is a distinct audio scope, even when its source is unchanged.
+    another = MeetingScope(SCOPE.session_id, SCOPE.team_name, "another")
+    await db.meeting.create_meeting(another)
+    linked = await db.meeting.enqueue(
+        another,
+        "original",
+        "a",
+        source_message_id=original.source_message_id,
+        speech_text=original.speech_text,
+    )
+    assert linked.source_message_id == original.source_message_id
+
+
+@pytest.mark.parametrize("invalid_source", [True, False])
+async def test_database_enforces_reference_and_unique_source(db: TeamDatabase, invalid_source: bool) -> None:
+    original = await _enqueue(db, SCOPE, "original", "a")
+    model = _get_speech_request_model(SCOPE.session_id)
+    with pytest.raises(IntegrityError):
+        async with db._sessions.write() as session:
+            await session.execute(
+                insert(model).values(
+                    team_name="team",
+                    meeting_id="meeting",
+                    request_id="bypass-dao",
+                    member_name="a",
+                    source_message_id="missing" if invalid_source else original.source_message_id,
+                    speech_text="spoken",
+                    sequence=2,
+                    created_at=1,
+                )
+            )
+            await session.commit()
+    assert len(await db.meeting.list_pending(SCOPE)) == 1
+
+
+async def test_source_deletion_is_restricted_without_changing_ownership(db: TeamDatabase) -> None:
+    original = await _enqueue(db, SCOPE, "original", "a")
+    granted = await db.meeting.grant_next(SCOPE)
+    message_model = _get_message_model(SCOPE.session_id)
+    with pytest.raises(IntegrityError):
+        async with db._sessions.write() as session:
+            await session.execute(delete(message_model).where(message_model.message_id == original.source_message_id))
+            await session.commit()
+    assert (await db.meeting.get_meeting(SCOPE)).lease_token == granted.lease_token
+    assert (await db.meeting.get_request(SCOPE, "original")).source_message_id == original.source_message_id
+
+
+@pytest.mark.parametrize("same_request_id", [True, False])
+async def test_independent_engines_cannot_conflict_on_audio_payload(
+    db: TeamDatabase,
+    same_request_id: bool,
+) -> None:
+    original = await _enqueue(db, SCOPE, "seed", "a")
+    async with db._sessions.write() as session:
+        await session.execute(delete(_get_speech_request_model(SCOPE.session_id)))
+        await session.commit()
+    other = TeamDatabase(db.config)
+    await other.initialize()
+    try:
+        results = await asyncio.gather(
+            db.meeting.enqueue(
+                SCOPE,
+                "winner",
+                "a",
+                source_message_id=original.source_message_id,
+                speech_text="first summary",
+            ),
+            other.meeting.enqueue(
+                SCOPE,
+                "winner" if same_request_id else "competitor",
+                "a",
+                source_message_id=original.source_message_id,
+                speech_text="second summary",
+            ),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(result, ValueError) for result in results) == 1
+        pending = await db.meeting.list_pending(SCOPE)
+        assert len(pending) == 1
+        winner = next(result for result in results if not isinstance(result, Exception))
+        assert pending[0].request_id == winner.request_id
+        assert pending[0].speech_text == winner.speech_text
+        assert (await db.meeting.get_meeting(SCOPE)).next_sequence == 2
+    finally:
+        await other.close()
+
+
+async def test_source_deletion_racing_admission_never_leaves_a_dangling_request(db: TeamDatabase) -> None:
+    original = await _enqueue(db, SCOPE, "seed", "a")
+    request_model = _get_speech_request_model(SCOPE.session_id)
+    message_model = _get_message_model(SCOPE.session_id)
+    async with db._sessions.write() as session:
+        await session.execute(delete(request_model))
+        await session.commit()
+    other = TeamDatabase(db.config)
+    await other.initialize()
+
+    async def delete_source() -> None:
+        async with other._sessions.write() as session:
+            await session.execute(delete(message_model).where(message_model.message_id == original.source_message_id))
+            await session.commit()
+
+    try:
+        results = await asyncio.gather(
+            db.meeting.enqueue(
+                SCOPE,
+                "race",
+                "a",
+                source_message_id=original.source_message_id,
+                speech_text="spoken",
+            ),
+            delete_source(),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(result, IntegrityError) for result in results) == 1
+        request = await db.meeting.get_request(SCOPE, "race")
+        async with db._sessions.read() as session:
+            source = await session.get(message_model, original.source_message_id)
+        assert (request is None) == (source is None)
+    finally:
+        await other.close()
+
+
+@pytest.mark.parametrize("populated", [False, True])
+@pytest.mark.parametrize("bind_session", [False, True])
+async def test_legacy_queue_upgrade_never_invents_links(
+    db: TeamDatabase,
+    populated: bool,
+    bind_session: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    model = _get_speech_request_model(SCOPE.session_id)
+    async with db.engine.begin() as conn:
+        await conn.run_sync(model.__table__.drop)
+        await conn.exec_driver_sql(
+            f'CREATE TABLE "{model.__tablename__}" (request_id VARCHAR PRIMARY KEY, member_name VARCHAR)'
+        )
+        if populated:
+            await conn.exec_driver_sql(f"INSERT INTO \"{model.__tablename__}\" VALUES ('legacy', 'a')")
+
+    async def ensure_tables() -> None:
+        token = set_session_id(SCOPE.session_id)
+        try:
+            if bind_session:
+                await db.create_cur_session_tables()
+            else:
+                await db.meeting.create_meeting(SCOPE)
+        finally:
+            reset_session_id(token)
+
+    if populated:
+        with pytest.raises(ValidationError, match="Legacy speech requests") as error:
+            await ensure_tables()
+        assert error.value.status is StatusCode.AGENT_TEAM_STATE_INVALID
+        assert model.__tablename__ in str(error.value)
+        assert any(
+            record.levelname == "ERROR"
+            and f"Cannot migrate legacy speech request table {model.__tablename__}" in record.message
+            for record in caplog.records
+        )
+        async with db.engine.begin() as conn:
+            result = await conn.exec_driver_sql(f'SELECT request_id FROM "{model.__tablename__}"')
+            assert result.scalar_one() == "legacy"
+    else:
+        await ensure_tables()
+        await ensure_tables()
+        migrations = [
+            record
+            for record in caplog.records
+            if f"Migrated legacy speech request table {model.__tablename__}" in record.message
+        ]
+        assert len(migrations) == 1
+        assert migrations[0].levelname == "INFO"
+        assert (await _enqueue(db, SCOPE, "upgraded", "a")).source_message_id == "message:team:a:upgraded"
+
+
+async def test_ensure_speech_request_schema_ignores_absent_table(db: TeamDatabase) -> None:
+    model = _get_speech_request_model(SCOPE.session_id)
+    async with db.engine.begin() as conn:
+        await conn.run_sync(model.__table__.drop)
+        await conn.run_sync(_ensure_speech_request_schema, model.__table__)
+        assert not await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table(model.__tablename__))
+
+
+async def test_ensure_speech_request_schema_leaves_current_table_untouched(
+    db: TeamDatabase,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request = await _enqueue(db, SCOPE, "current", "a")
+    caplog.set_level("INFO")
+    caplog.clear()
+    await db.meeting.create_meeting(SCOPE)
+    assert (await db.meeting.get_request(SCOPE, "current")).speech_text == request.speech_text
+    assert not any("legacy speech request table" in record.message for record in caplog.records)
 
 
 def _process_grant(db_path: str, barrier) -> str | None:
@@ -367,8 +670,8 @@ def _process_grant(db_path: str, barrier) -> str | None:
 
 
 async def test_independent_processes_cannot_both_own_meeting(db: TeamDatabase) -> None:
-    await db.meeting.enqueue(SCOPE, "one", "a")
-    await db.meeting.enqueue(SCOPE, "two", "b")
+    await _enqueue(db, SCOPE, "one", "a")
+    await _enqueue(db, SCOPE, "two", "b")
     context = multiprocessing.get_context("spawn")
 
     def contend() -> list[str | None]:

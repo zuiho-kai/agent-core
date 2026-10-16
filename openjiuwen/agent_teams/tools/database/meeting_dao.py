@@ -123,10 +123,26 @@ class MeetingDao:
         meeting_model = _get_meeting_model(scope.session_id)
         return await self._get_row(meeting_model, _scope_values(scope))
 
-    async def enqueue(self, scope: MeetingScope, request_id: str, member_name: str) -> TeamSpeechRequestBase:
-        """Admit a registered agent; repeated IDs never enqueue another operation."""
+    async def enqueue(
+        self,
+        scope: MeetingScope,
+        request_id: str,
+        member_name: str,
+        *,
+        source_message_id: str,
+        speech_text: str,
+    ) -> TeamSpeechRequestBase:
+        """Atomically bind audio to a committed message and immutable spoken summary.
+
+        The foreign key requires a normal message in this session. Source team
+        and author validation belongs to the caller/wrapper. Retrying an ID with
+        a different source or summary is an error, including after completion.
+        Text delivery is independent of audio admission.
+        """
         if not request_id.strip():
             raise ValueError("Request ID must be non-empty")
+        if not source_message_id.strip() or not speech_text.strip():
+            raise ValueError("Source message ID and speech text must be non-empty")
         request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
             if meeting.closed:
@@ -136,6 +152,8 @@ class MeetingDao:
             if existing is not None:
                 if existing.member_name != member_name:
                     raise ValueError("Request ID belongs to another member")
+                if existing.source_message_id != source_message_id or existing.speech_text != speech_text:
+                    raise ValueError("Request ID already has a different source message or speech text")
                 return existing
             role = await session.scalar(
                 select(TeamMember.role).where(
@@ -144,9 +162,21 @@ class MeetingDao:
             )
             if role not in {"leader", "teammate", "bridge_agent", "external_cli"}:
                 raise ValueError("Only registered agent members may enter the speaking queue")
+            duplicate = await session.scalar(
+                select(request_model.request_id).where(
+                    *_scope_filter(request_model, scope), request_model.source_message_id == source_message_id
+                )
+            )
+            if duplicate is not None:
+                raise ValueError("Source message already has a speech request in this meeting")
             meeting.next_sequence += 1
             request = request_model(
-                **key, member_name=member_name, sequence=meeting.next_sequence, created_at=get_current_time()
+                **key,
+                member_name=member_name,
+                source_message_id=source_message_id,
+                speech_text=speech_text,
+                sequence=meeting.next_sequence,
+                created_at=get_current_time(),
             )
             session.add(request)
             return request

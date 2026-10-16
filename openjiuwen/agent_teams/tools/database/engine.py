@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 
-from sqlalchemy import event, inspect
+from sqlalchemy import Table, event, inspect, select
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import (
@@ -37,6 +38,8 @@ from openjiuwen.agent_teams.tools.models import (
     _sanitize_session_id_for_table,
     static_tables,
 )
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
 
 
@@ -368,6 +371,26 @@ def _ensure_message_meta_column(sync_conn) -> None:
             continue
         sync_conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN meta TEXT")
         team_logger.info("Migrated legacy message table %s: added meta column", table_name)
+
+
+def _ensure_speech_request_schema(sync_conn: Connection, table: Table) -> None:
+    """Rebuild empty prototype queues; populated rows cannot be safely backfilled."""
+    inspector = inspect(sync_conn)
+    if not inspector.has_table(table.name):
+        return
+    columns = {column["name"] for column in inspector.get_columns(table.name)}
+    if {"source_message_id", "speech_text"} <= columns:
+        return
+    if sync_conn.execute(select(table.c.request_id).limit(1)).first() is not None:
+        reason = (
+            f"Legacy speech requests in table {table.name} cannot be safely backfilled; "
+            "preserve the data and use a new session, or release the legacy session"
+        )
+        team_logger.error("Cannot migrate legacy speech request table %s: %s", table.name, reason)
+        raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason=reason)
+    table.drop(sync_conn)
+    table.create(sync_conn)
+    team_logger.info("Migrated legacy speech request table %s: rebuilt with strict message linkage", table.name)
 
 
 def _current_session_migration_tables() -> list[str]:
@@ -797,6 +820,7 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
         speech_request_model,
     ):
         await conn.run_sync(model.__table__.create, checkfirst=True)
+    await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
     await conn.run_sync(_ensure_message_protocol_column)
     await conn.run_sync(_ensure_message_meta_column)
     await conn.run_sync(
@@ -807,13 +831,15 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
 async def create_meeting_tables(sessions: DbSessions, session_id: str) -> None:
     """Ensure an explicitly scoped meeting's tables under the shared DDL/write lock."""
     meeting_model = _get_meeting_model(session_id)
+    message_model = _get_message_model(session_id)
     speech_request_model = _get_speech_request_model(session_id)
 
     async def _create_once() -> bool:
         async with sessions.write() as session:
             conn = await session.connection()
-            for model in (meeting_model, speech_request_model):
+            for model in (message_model, meeting_model, speech_request_model):
                 await conn.run_sync(model.__table__.create, checkfirst=True)
+            await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
             await session.commit()
         return True
 
@@ -911,10 +937,10 @@ async def drop_cur_session_tables(engine: AsyncEngine) -> None:
         for model in (
             task_model,
             dep_model,
+            speech_request_model,
             message_model,
             read_status_model,
             review_vote_model,
-            speech_request_model,
             meeting_model,
         ):
             await conn.run_sync(model.__table__.drop, checkfirst=True)
@@ -938,7 +964,7 @@ async def cleanup_all_runtime_state(
     async with engine.begin() as conn:
         table_names = await conn.run_sync(_get_table_names)
 
-        for table_name in table_names:
+        for table_name in sorted(table_names, key=lambda name: not name.startswith("team_speech_request_")):
             if not table_name.startswith(TEAM_DYNAMIC_TABLE_PREFIXES):
                 continue
             await conn.run_sync(_drop_table, table_name)
