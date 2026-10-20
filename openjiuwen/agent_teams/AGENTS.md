@@ -35,6 +35,7 @@ Loop 控制循环，原子动作不进入该协议层级。
 | 入口 | 用途 |
 |---|---|
 | `TeamAgentSpec(...).build()` | 从零组装 TeamAgent 的唯一公共路径。`agents["leader"]` 必填，`agents["teammate"]` 可选 |
+| `MeetingCoordinator(database, scope)` | Explicit meeting queue wrapper over an existing database; validates source identity and keeps audio acknowledgement separate from A2A delivery. Optional message manager/conversation dependencies support bound `MeetingMemberClient` queueing and grant-gated publication and `create_meeting_tools`, including speaker inspection and Leader interruption. Does not construct a Team or select a playback client. See S_30 sections 13–14. |
 | `Runner.run_agent_team[_streaming](agent_team=spec, session=..., ...)` | 运行入口；冷启动 / 热恢复 / 切 session 由 `runtime` 子系统的 dispatch 表自动选 |
 | `cli.run_team_cli(*, specs=None, yaml_paths=None)` | 交互式 TUI 公共入口。`/team` `/session` `/spec` 子命令覆盖 lifecycle 全 facade，普通文本透传 `Runner.interact_agent_team`。详见 `cli/AGENTS.md` |
 
@@ -60,6 +61,7 @@ agent_teams/
 ├── paths.py             # 文件系统布局单一真相源
 ├── schema/              # 全部数据模型（Spec / Context / Event / Status / Task）
 ├── models/              # 多模型部署原语（ModelPoolEntry / 池继承 / Allocator）
+├── meeting/             # Public explicit meeting wrapper; frozen speech-plus-source results, queued full content and normal Team sending after grant, existing queue operations. No runtime/connection ownership or background scheduling.
 ├── agent/               # 核心运行时（TeamAgent 本体 + 装配链）
 ├── prompts/             # 系统提示词模板、加载器、PromptSection 构造与缓存
 ├── rails/               # 团队 Rail + manifest 元素声明（team rail / 内置 rail·tool / context handle / team confirm payload）

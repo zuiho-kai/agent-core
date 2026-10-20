@@ -108,23 +108,23 @@ async def test_priority_fifo_and_no_preemption(db: TeamDatabase) -> None:
     assert await dao.grant_next(SCOPE) is None
 
 
-async def test_deduplication_and_queued_only_cancellation(db: TeamDatabase) -> None:
+async def test_duplicate_rejection_and_queued_only_cancellation(db: TeamDatabase) -> None:
     dao = db.meeting
-    original = await _enqueue(db, SCOPE, "one", "a")
-    duplicate = await _enqueue(db, SCOPE, "one", "a")
-    assert original.sequence == duplicate.sequence
-    with pytest.raises(ValueError, match="another member"):
+    await _enqueue(db, SCOPE, "one", "a")
+    with pytest.raises(IntegrityError):
+        await _enqueue(db, SCOPE, "one", "a")
+    with pytest.raises(IntegrityError):
         await _enqueue(db, SCOPE, "one", "b")
     assert await dao.cancel_request(SCOPE, "one")
     assert not await dao.cancel_request(SCOPE, "one")
     assert not await dao.cancel_request(SCOPE, "missing")
-    assert (await _enqueue(db, SCOPE, "one", "a")).status == SpeechRequestStatus.CANCELLED
+    assert (await dao.get_request(SCOPE, "one")).status == SpeechRequestStatus.CANCELLED
     await _enqueue(db, SCOPE, "two", "a")
     granted = await dao.grant_next(SCOPE)
     assert granted.request_id == "two"
     assert not await dao.cancel_request(SCOPE, "two")
     assert await dao.complete_playback(SCOPE, granted.lease_token)
-    assert (await _enqueue(db, SCOPE, "two", "a")).status == SpeechRequestStatus.COMPLETED
+    assert (await dao.get_request(SCOPE, "two")).status == SpeechRequestStatus.COMPLETED
     assert await dao.grant_next(SCOPE) is None
 
 
@@ -291,8 +291,9 @@ async def test_independent_engines_admit_once_and_grant_one_owner(db: TeamDataba
         admissions = await asyncio.gather(
             _enqueue(db, SCOPE, "duplicate", "a"),
             _enqueue(other, SCOPE, "duplicate", "a"),
+            return_exceptions=True,
         )
-        assert admissions[0].sequence == admissions[1].sequence
+        assert sum(isinstance(result, IntegrityError) for result in admissions) == 1
         await asyncio.gather(
             _enqueue(db, SCOPE, "two", "b"),
             _enqueue(other, SCOPE, "three", "a"),
@@ -423,18 +424,18 @@ async def test_foreign_key_rejects_missing_and_cross_session_sources(db: TeamDat
     assert await db.meeting.list_pending(SCOPE) == []
 
 
-async def test_retry_cannot_change_source_or_summary_even_after_completion(db: TeamDatabase) -> None:
+async def test_duplicate_id_cannot_change_source_or_summary_even_after_completion(db: TeamDatabase) -> None:
     first = await _enqueue(db, SCOPE, "first", "a")
     second = await _enqueue(db, SCOPE, "second", "a")
     for source, summary in (
         (second.source_message_id, first.speech_text),
         (first.source_message_id, "replacement summary"),
     ):
-        with pytest.raises(ValueError, match="different source message or speech text"):
+        with pytest.raises(IntegrityError):
             await db.meeting.enqueue(SCOPE, "first", "a", source_message_id=source, speech_text=summary)
     grant = await db.meeting.grant_next(SCOPE)
     await db.meeting.complete_playback(SCOPE, grant.lease_token)
-    with pytest.raises(ValueError, match="different source message or speech text"):
+    with pytest.raises(IntegrityError):
         await db.meeting.enqueue(
             SCOPE,
             "first",
@@ -448,7 +449,7 @@ async def test_retry_cannot_change_source_or_summary_even_after_completion(db: T
 
 async def test_source_message_cannot_enqueue_twice_under_different_ids(db: TeamDatabase) -> None:
     original = await _enqueue(db, SCOPE, "original", "a")
-    with pytest.raises(ValueError, match="already has a speech request"):
+    with pytest.raises(IntegrityError):
         await db.meeting.enqueue(
             SCOPE,
             "duplicate",
@@ -532,7 +533,7 @@ async def test_independent_engines_cannot_conflict_on_audio_payload(
             ),
             return_exceptions=True,
         )
-        assert sum(isinstance(result, ValueError) for result in results) == 1
+        assert sum(isinstance(result, IntegrityError) for result in results) == 1
         pending = await db.meeting.list_pending(SCOPE)
         assert len(pending) == 1
         winner = next(result for result in results if not isinstance(result, Exception))
@@ -686,3 +687,59 @@ async def test_independent_processes_cannot_both_own_meeting(db: TeamDatabase) -
     meeting = await db.meeting.get_meeting(SCOPE)
     assert meeting.owner_request_id == "one"
     assert meeting.lease_token in tokens
+
+
+async def test_queue_content_needs_no_source_until_normal_send(db: TeamDatabase) -> None:
+    first = await db.meeting.enqueue(
+        SCOPE, "pending-one", "a", content="Full first", speech_text="First", mentions=["b"]
+    )
+    second = await db.meeting.enqueue(SCOPE, "pending-two", "b", content="Full second", speech_text="Second")
+    assert first.source_message_id is None and second.source_message_id is None
+    assert [row.request_id for row in await db.meeting.list_pending(SCOPE)] == ["pending-one", "pending-two"]
+    token = set_session_id(SCOPE.session_id)
+    try:
+        assert await db.message.get_team_messages("team") == []
+        with pytest.raises(IntegrityError):
+            await db.meeting.record_publication(SCOPE, first.request_id, "missing")
+        retained = await db.meeting.get_request(SCOPE, first.request_id)
+        assert retained.content == "Full first" and retained.source_message_id is None
+        assert await db.message.create_message(
+            "sent-first", "team", "a", "Full first", broadcast=True, inline_content=True
+        )
+        await db.meeting.record_publication(SCOPE, first.request_id, "sent-first")
+        stored = await db.meeting.get_request(SCOPE, first.request_id)
+        assert stored.source_message_id == "sent-first" and stored.content is None
+        with pytest.raises(IntegrityError):
+            async with db._sessions.write() as session:
+                await session.execute(
+                    delete(_get_message_model(SCOPE.session_id)).where(
+                        _get_message_model(SCOPE.session_id).message_id == "sent-first"
+                    )
+                )
+                await session.commit()
+    finally:
+        reset_session_id(token)
+
+
+@pytest.mark.parametrize("populated", [False, True])
+async def test_previous_linked_queue_schema_is_preserved_or_rebuilt(db: TeamDatabase, populated: bool) -> None:
+    model = _get_speech_request_model(SCOPE.session_id)
+    async with db.engine.begin() as conn:
+        await conn.run_sync(model.__table__.drop)
+        await conn.exec_driver_sql(
+            f'CREATE TABLE "{model.__tablename__}" '
+            "(request_id VARCHAR PRIMARY KEY, source_message_id VARCHAR NOT NULL, speech_text TEXT NOT NULL)"
+        )
+        if populated:
+            await conn.exec_driver_sql(f"INSERT INTO \"{model.__tablename__}\" VALUES ('legacy', 'source', 'summary')")
+    if populated:
+        with pytest.raises(ValidationError, match="Legacy speech requests"):
+            await db.meeting.create_meeting(SCOPE)
+        async with db.engine.begin() as conn:
+            assert (
+                await conn.exec_driver_sql(f'SELECT source_message_id FROM "{model.__tablename__}"')
+            ).scalar_one() == "source"
+    else:
+        await db.meeting.create_meeting(SCOPE)
+        row = await db.meeting.enqueue(SCOPE, "new-content", "a", content="Full text", speech_text="Summary")
+        assert row.source_message_id is None and row.content == "Full text"

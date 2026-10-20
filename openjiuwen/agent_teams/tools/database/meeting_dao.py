@@ -129,32 +129,30 @@ class MeetingDao:
         request_id: str,
         member_name: str,
         *,
-        source_message_id: str,
         speech_text: str,
+        content: str | None = None,
+        mentions: Iterable[str] = (),
+        source_message_id: str | None = None,
     ) -> TeamSpeechRequestBase:
-        """Atomically bind audio to a committed message and immutable spoken summary.
+        """Queue full text and summary, or reference an already sent source.
 
-        The foreign key requires a normal message in this session. Source team
-        and author validation belongs to the caller/wrapper. Retrying an ID with
-        a different source or summary is an error, including after completion.
-        Text delivery is independent of audio admission.
+        Source identity and recipient validation belong to the wrapper. Database
+        constraints reject duplicate IDs and invalid non-null source references.
         """
         if not request_id.strip():
             raise ValueError("Request ID must be non-empty")
-        if not source_message_id.strip() or not speech_text.strip():
-            raise ValueError("Source message ID and speech text must be non-empty")
+        if not speech_text.strip():
+            raise ValueError("Speech text must be non-empty")
+        if source_message_id is not None:
+            if not source_message_id.strip():
+                raise ValueError("Source message ID must be non-empty")
+        elif content is None or not content.strip():
+            raise ValueError("Queued content must be non-empty")
         request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
             if meeting.closed:
                 raise ValueError("Meeting is closed")
             key = {**_scope_values(scope), "request_id": request_id}
-            existing = await session.get(request_model, key)
-            if existing is not None:
-                if existing.member_name != member_name:
-                    raise ValueError("Request ID belongs to another member")
-                if existing.source_message_id != source_message_id or existing.speech_text != speech_text:
-                    raise ValueError("Request ID already has a different source message or speech text")
-                return existing
             role = await session.scalar(
                 select(TeamMember.role).where(
                     TeamMember.team_name == scope.team_name, TeamMember.member_name == member_name
@@ -162,19 +160,14 @@ class MeetingDao:
             )
             if role not in {"leader", "teammate", "bridge_agent", "external_cli"}:
                 raise ValueError("Only registered agent members may enter the speaking queue")
-            duplicate = await session.scalar(
-                select(request_model.request_id).where(
-                    *_scope_filter(request_model, scope), request_model.source_message_id == source_message_id
-                )
-            )
-            if duplicate is not None:
-                raise ValueError("Source message already has a speech request in this meeting")
             meeting.next_sequence += 1
             request = request_model(
                 **key,
                 member_name=member_name,
                 source_message_id=source_message_id,
+                content=content,
                 speech_text=speech_text,
+                mentions=json.dumps(list(mentions)),
                 sequence=meeting.next_sequence,
                 created_at=get_current_time(),
             )
@@ -211,12 +204,12 @@ class MeetingDao:
             return list(result)
 
     async def get_request(self, scope: MeetingScope, request_id: str) -> TeamSpeechRequestBase | None:
-        """Read a queued, granted, or terminal request for deduplication/completion."""
+        """Read a queued, granted, or terminal request for inspection/completion."""
         request_model = _get_speech_request_model(scope.session_id)
         return await self._get_row(request_model, {**_scope_values(scope), "request_id": request_id})
 
     async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
-        """Grant exactly one pending request; priority never preempts an owner."""
+        """Grant one lease; message sending runs afterward in the wrapper."""
         async with self._locked(scope) as (session, meeting):
             if meeting.closed or meeting.interruption_id or meeting.owner_request_id:
                 return None
@@ -229,6 +222,20 @@ class MeetingDao:
             meeting.owner_request_id = request.request_id
             meeting.lease_token = request.lease_token
             return request
+
+    async def record_publication(self, scope: MeetingScope, request_id: str, message_id: str) -> None:
+        """Replace queued full text with the message reference after normal sending.
+
+        Sending may overlap an interruption. Record the resulting message even
+        then; text already sent remains published while playback is revoked.
+        """
+        request_model = _get_speech_request_model(scope.session_id)
+        async with self._locked(scope) as (session, _):
+            await session.execute(
+                update(request_model)
+                .where(*_scope_filter(request_model, scope), request_model.request_id == request_id)
+                .values(source_message_id=message_id, content=None)
+            )
 
     async def cancel_request(self, scope: MeetingScope, request_id: str) -> bool:
         """Cancel only a queued operation; never retract a granted/published message."""

@@ -37,3 +37,81 @@ class SpeechInterruption:
     interruption_id: str
     request_id: str | None
     lease_token: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingState:
+    """Detached observation of a meeting; reading it does not claim playback."""
+
+    scope: MeetingScope
+    leader_member_name: str
+    addressed_members: tuple[str, ...]
+    closed: bool
+    owner_request_id: str | None
+    lease_token: str | None
+    interruption_id: str | None
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechRequest:
+    """Full queued content and summary, with a normal message reference after sending."""
+
+    scope: MeetingScope
+    request_id: str
+    member_name: str
+    source_message_id: str | None
+    speech_text: str
+    sequence: int
+    status: SpeechRequestStatus
+    lease_token: str | None
+    created_at: int
+    granted_at: int | None
+    content: str | None = None
+    mentions: tuple[str, ...] = ()
+    message: "SpeechSource | None" = None
+    message_error: str | None = None
+    delivery_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechSource:
+    """Read-only text projection; obtaining it never acknowledges delivery."""
+
+    scope: MeetingScope
+    message_id: str
+    member_name: str
+    content: str
+    to_member_name: str | None
+    broadcast: bool
+    protocol: str
+    timestamp: int
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingMessage:
+    """Queued utterance or public conversation message viewed through the bound scope."""
+
+    scope: MeetingScope
+    message_id: str | None
+    member_name: str
+    content: str
+    mentions: tuple[str, ...]
+    timestamp: int
+    published: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingPostResult:
+    """Queued agent utterance or immediately published human input."""
+
+    message: MeetingMessage
+    duplicate: bool
+    notified_members: tuple[str, ...]
+    speech_request: SpeechRequest | None
+    # Admission failures raise without creating a normal message.
+    audio_error: str | None = None
+
+    @property
+    def published(self) -> bool:
+        return self.message.published

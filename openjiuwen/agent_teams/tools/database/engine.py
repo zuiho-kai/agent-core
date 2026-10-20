@@ -378,8 +378,10 @@ def _ensure_speech_request_schema(sync_conn: Connection, table: Table) -> None:
     inspector = inspect(sync_conn)
     if not inspector.has_table(table.name):
         return
-    columns = {column["name"] for column in inspector.get_columns(table.name)}
-    if {"source_message_id", "speech_text"} <= columns:
+    columns = {column["name"]: column for column in inspector.get_columns(table.name)}
+    if {"source_message_id", "speech_text", "content", "mentions"} <= columns.keys() and columns[
+        "source_message_id"
+    ]["nullable"]:
         return
     if sync_conn.execute(select(table.c.request_id).limit(1)).first() is not None:
         reason = (
@@ -390,7 +392,9 @@ def _ensure_speech_request_schema(sync_conn: Connection, table: Table) -> None:
         raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason=reason)
     table.drop(sync_conn)
     table.create(sync_conn)
-    team_logger.info("Migrated legacy speech request table %s: rebuilt with strict message linkage", table.name)
+    team_logger.info(
+        "Migrated legacy speech request table %s: rebuilt with queued content and optional linkage", table.name
+    )
 
 
 def _current_session_migration_tables() -> list[str]:
