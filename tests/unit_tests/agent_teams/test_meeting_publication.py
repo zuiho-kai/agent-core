@@ -9,7 +9,7 @@ import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -489,7 +489,7 @@ async def test_recording_failure_after_send_keeps_reference_recoverable(runtime,
         runtime.db.meeting, "record_publication", AsyncMock(side_effect=SQLAlchemyError("record failed"))
     )
     lease = await runtime.meeting.grant_next()
-    assert lease.delivery_error and lease.source_message_id is None
+    assert lease.delivery_error and lease.source_message_id is not None
     assert len(await _rows(runtime)) == 1
     queued = await runtime.db.meeting.get_request(SCOPE, lease.request_id)
     assert queued.content == "Complete explanation"
@@ -498,6 +498,55 @@ async def test_recording_failure_after_send_keeps_reference_recoverable(runtime,
     assert sent.source_message_id and sent.delivery_error is None
     assert len(await _rows(runtime)) == 1
     assert (await runtime.db.meeting.get_request(SCOPE, lease.request_id)).content is None
+
+
+@pytest.mark.parametrize("departed", ["a", "b"])
+@pytest.mark.parametrize("failure_phase", ["history", "recording"])
+async def test_publication_recovery_survives_member_departure(runtime, monkeypatch, departed, failure_phase):
+    await _post(runtime.meeting.for_member("a"))
+    if failure_phase == "history":
+        owner, method = runtime.conversation, "sync"
+        failure = Mock(side_effect=OSError("history unavailable"))
+    else:
+        owner, method = runtime.db.meeting, "record_publication"
+        failure = AsyncMock(side_effect=SQLAlchemyError("record failed"))
+    original = getattr(owner, method)
+    monkeypatch.setattr(owner, method, failure)
+    lease = await runtime.meeting.grant_next()
+    assert lease.delivery_error and lease.lease_token
+    rows = await _rows(runtime)
+    assert len(rows) == 1
+    assert lease.source_message_id == (rows[0].message_id if failure_phase == "recording" else None)
+    monkeypatch.setattr(owner, method, original)
+    assert await runtime.db.member.update_member_status(departed, "team", "shutdown_requested")
+    # Recover the committed row, never insert another message after departure.
+    monkeypatch.setattr(
+        runtime.db.message, "create_message", AsyncMock(side_effect=AssertionError("must reuse source"))
+    )
+    recovered = await runtime.meeting.retry_publication(lease.lease_token)
+    assert recovered.delivery_error is None and recovered.message_error is None
+    assert recovered.lease_token == lease.lease_token
+    assert recovered.source_message_id == rows[0].message_id
+    assert recovered.content == "Complete explanation"
+    queued = await runtime.db.meeting.get_request(SCOPE, lease.request_id)
+    assert queued.source_message_id == rows[0].message_id and queued.content is None
+    assert len(await _rows(runtime)) == 1
+    records = [json.loads(line) for line in runtime.conversation.history_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["message_id"] for record in records] == [rows[0].message_id]
+    assert await runtime.meeting.retry_publication("stale") is None
+    assert await runtime.meeting.complete_playback(recovered.lease_token)
+
+
+@pytest.mark.parametrize("departed", ["a", "b"])
+async def test_unsent_publication_still_rejects_departed_members(runtime, departed):
+    await _post(runtime.meeting.for_member("a"))
+    assert await runtime.db.member.update_member_status(departed, "team", "shutdown_requested")
+    lease = await runtime.meeting.grant_next()
+    assert lease.delivery_error and lease.source_message_id is None
+    assert await _rows(runtime) == []
+    recovered = await runtime.meeting.retry_publication(lease.lease_token)
+    assert recovered.delivery_error and recovered.source_message_id is None
+    assert await _rows(runtime) == []
 
 
 @pytest.mark.parametrize("termination", ["cancel", "close"])

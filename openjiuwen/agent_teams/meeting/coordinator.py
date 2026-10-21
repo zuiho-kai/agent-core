@@ -7,12 +7,12 @@ import json
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
-from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message
+from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message, sync_history
 from openjiuwen.agent_teams.schema.meeting import (
     MeetingMessage,
     MeetingPostResult,
@@ -349,7 +349,7 @@ class MeetingCoordinator:
             return None
         return await self._publish_granted(await self._request(row))
 
-    async def _publish_granted(self, request: SpeechRequest) -> SpeechRequest | None:
+    async def _publish_granted(self, request: SpeechRequest, *, recover: bool = False) -> SpeechRequest | None:
         """Send only claimed queue content; ordinary reads never publish anything."""
         state = await self.get_state()
         if state is None or state.closed or state.lease_token != request.lease_token:
@@ -358,11 +358,43 @@ class MeetingCoordinator:
             try:
                 if self._message_manager is None or self._conversation is None:
                     raise ValueError("Sending queued speech requires message manager and conversation")
-                posted = await self._send_message(
-                    request.member_name, request.content, request.mentions, request.request_id
-                )
+                source_id = None
+                if recover:
+                    # Use the existing group submission identity only on recovery;
+                    # an already committed message may outlive its members.
+                    identity = str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            json.dumps(
+                                [self.scope.team_name, self.scope.session_id, request.request_id], ensure_ascii=False
+                            ),
+                        )
+                    )
+                    source = await self._get_conversation_message(identity)
+                    if source is not None:
+                        if (source.member_name, source.content, source.mentions) != (
+                            request.member_name,
+                            request.content,
+                            request.mentions,
+                        ):
+                            raise ValueError("Stored publication does not match the queued utterance")
+                        token = set_session_id(self.scope.session_id)
+                        try:
+                            await sync_history(self._conversation, self._message_manager)
+                            await self._message_manager.publish_broadcast(identity, request.member_name)
+                        finally:
+                            reset_session_id(token)
+                        source_id = source.message_id
+                if source_id is None:
+                    posted = await self._send_message(
+                        request.member_name, request.content, request.mentions, request.request_id
+                    )
+                    source_id = posted.message.message_id
+                # Preserve the known source in the error result if recording
+                # its durable queue link fails after sending has succeeded.
+                request = replace(request, source_message_id=source_id)
                 dao = await self._dao()
-                await dao.record_publication(self.scope, request.request_id, posted.message.message_id)
+                await dao.record_publication(self.scope, request.request_id, source_id)
                 updated = await self.get_request(request.request_id)
                 if updated is None:
                     return None
@@ -382,7 +414,7 @@ class MeetingCoordinator:
         request = await self.get_speaker()
         if request is None or request.lease_token != lease_token:
             return None
-        return await self._publish_granted(request)
+        return await self._publish_granted(request, recover=True)
 
     async def get_speaker(self) -> SpeechRequest | None:
         """Observe the current lease; a concurrent release can make it stale immediately."""

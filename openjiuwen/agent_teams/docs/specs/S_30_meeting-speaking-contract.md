@@ -5,7 +5,7 @@
 | Item | Value |
 |---|---|
 | Status | Database queue, strict message linkage, and explicit meeting wrapper implemented; runtime/audio integration remains proposed |
-| Date | 2026-10-20 |
+| Date | 2026-10-21 |
 | Scope | PR2: meeting coordination in `agent-core` |
 | Requirements | [agent-core #1951](https://github.com/openJiuwen-ai/agent-core/issues/1951), [JiuwenSwarm #8260](https://github.com/openJiuwen-ai/jiuwenswarm/issues/8260) |
 | Foundation | [agent-core #1905](https://github.com/openJiuwen-ai/agent-core/pull/1905) |
@@ -241,12 +241,20 @@ without hiding the current token. A sending/history/link-recording failure retur
 that token with delivery_error, leaves unsent queue content available, and blocks a
 successor until the host recovers or releases the lease. The host must not start audio
 while either error is present. retry_publication targets only the current token and
-uses the existing group path's behavior; it does not implement posting deduplication.
+uses the existing group submission identity to recover committed text; it does not
+implement posting deduplication. Recovery of committed text is handled inside the
+coordinator and does not require its author or recipients to remain active. New
+sends continue using the unchanged group path and its membership validation.
 
 Sending and recording its result are deliberately separate normal operations. If sending
 stores the message and a subsequent step fails, that message remains published and queue
 content remains until its link is recorded. Existing group submission identity lets
 current-token recovery find the same message. This is not a cross-DAO atomic transaction.
+If sending returned an ID before queue-link recording failed, the error result
+retains that known source_message_id; the persisted queue may still have no link.
+Recovery repairs history/notification through existing helpers before recording
+the source link and clearing queued content. It never inserts a second message
+when the existing submission is found.
 Bus errors retain normal Team semantics: they are logged, and inbox polling can still
 consume the stored message; notification is not a recipient-delivery acknowledgement.
 
