@@ -1,0 +1,1 @@
+查看当前会议的发言者。返回 request（成员、source_message_id、口语摘要和 lease_token）与 source（完整公开消息）；无人持有发言权时返回 null。读取不会确认消息投递或改变播放状态。观察结果可能过期；Leader 调用 meeting_interrupt_speech 时必须将观察到的 lease_token 原样作为 expected_token，避免误打断后续发言者。

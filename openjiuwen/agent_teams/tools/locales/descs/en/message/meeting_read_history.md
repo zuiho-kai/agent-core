@@ -1,0 +1,1 @@
+Read recent public group messages from your team in the current session. This is the existing conversation history, shared across meeting instances and ordinary group posts. Private messages and other teams/sessions are excluded. Reading does not acknowledge an agent inbox or change playback state. limit must be between 1 and 100.

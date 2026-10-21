@@ -33,7 +33,6 @@ from openjiuwen.agent_teams.tools.member_options import (
 from openjiuwen.agent_teams.tools.models import TeamMember
 from openjiuwen.core.common.logging import team_logger
 
-
 _DEPARTED_STATUS_VALUES: tuple[str, ...] = tuple(status.value for status in MEMBER_DEPARTED_STATUSES)
 _UNREACHABLE_STATUS_VALUES: tuple[str, ...] = tuple(status.value for status in MEMBER_UNREACHABLE_STATUSES)
 
@@ -287,6 +286,16 @@ class MemberDao:
                 )
             )
             return bool((await session.execute(stmt)).scalar())
+
+    async def get_member_role_status(self, member_name: str, team_name: str) -> tuple[str, str] | None:
+        """Read the capability-boundary role/status without loading card or prompt fields."""
+        async with self._sessions.read() as session:
+            row = (await session.execute(
+                select(TeamMember.role, TeamMember.status).where(
+                    TeamMember.team_name == team_name, TeamMember.member_name == member_name
+                )
+            )).one_or_none()
+            return (row.role, row.status) if row is not None else None
 
     async def get_member(self, member_name: str, team_name: str) -> Optional[TeamMember]:
         """Get member information by ID."""
