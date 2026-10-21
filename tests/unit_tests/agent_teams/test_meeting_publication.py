@@ -18,7 +18,10 @@ from sqlalchemy import event
 from sqlalchemy.exc import SQLAlchemyError
 
 from openjiuwen.agent_teams import MeetingCoordinator, MeetingScope, SpeechRequestStatus, create_meeting_tools
+from openjiuwen.agent_teams.agent.coordination.dispatcher import EventDispatcher
+from openjiuwen.agent_teams.agent.coordination.event_bus import InnerEventMessage, InnerEventType
 from openjiuwen.agent_teams.context import get_session_id, reset_session_id, set_session_id
+from openjiuwen.agent_teams.duplex import DuplexConfig
 from openjiuwen.agent_teams.group_chat.conversation import GroupConversationLog
 from openjiuwen.agent_teams.group_chat.handler import post_message
 from openjiuwen.agent_teams.group_chat.message_handler import GroupMessageHandler
@@ -27,6 +30,7 @@ from openjiuwen.agent_teams.schema.team import TeamRole
 from openjiuwen.agent_teams.tools.database import DatabaseConfig, TeamDatabase
 from openjiuwen.agent_teams.tools.message_manager import TeamMessageManager
 from openjiuwen.agent_teams.tools.team import TeamBackend
+from openjiuwen.core.foundation.llm.system_one import ChoiceAnswer
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.level1]
 SCOPE = MeetingScope("session", "team", "meeting")
@@ -704,6 +708,138 @@ async def test_existing_mailbox_delivers_full_text_after_grant_before_completion
         host.deliver_input.assert_awaited_once()
     finally:
         reset_session_id(token)
+
+
+@pytest_asyncio.fixture
+async def duplex_recipient(runtime, monkeypatch):
+    backend = TeamBackend("team", "b", False, runtime.db, runtime.manager.messager)
+    backend.group_chat_spec = SimpleNamespace(language="en", workspace=None)
+    backend.bind_group_session("session")
+    host = SimpleNamespace(
+        deliver_input=AsyncMock(),
+        has_pending_interrupt=lambda: False,
+        is_agent_ready=lambda: True,
+        is_agent_running=Mock(return_value=True),
+        harness=SimpleNamespace(interrupt=AsyncMock(return_value="interrupt")),
+    )
+    spec = SimpleNamespace(
+        duplex=DuplexConfig(enabled=True, mode="active", api_base="http://supervisor.invalid/v1", model="test"),
+        reliability=None,
+        stale_claim_idle_timeout=600,
+        stale_pending_idle_timeout=600,
+    )
+    blueprint = SimpleNamespace(member_name="b", role=TeamRole.TEAMMATE, team_spec=backend.group_chat_spec, spec=spec)
+    infra = SimpleNamespace(team_backend=backend, message_manager=backend.message_manager)
+    classifier = SimpleNamespace(classify=AsyncMock())
+    factory = Mock(return_value=classifier)
+    monkeypatch.setattr("openjiuwen.agent_teams.duplex.router.build_classifier", factory)
+    dispatcher = EventDispatcher(host, blueprint, infra, AsyncMock())
+    token = set_session_id("session")
+    try:
+        yield SimpleNamespace(host=host, dispatcher=dispatcher, classifier=classifier, factory=factory)
+    finally:
+        await dispatcher.aclose()
+        reset_session_id(token)
+
+
+@pytest.mark.parametrize(
+    "running,judgment,expected",
+    [
+        pytest.param(False, None, "deliver_now", id="idle-mentioned"),
+        pytest.param(True, "APPEND", "append", id="busy-mentioned-append"),
+        pytest.param(True, "INTERRUPT", "interrupt", id="busy-mentioned-interrupt"),
+        pytest.param(True, "failure", "append", id="busy-classifier-failure"),
+    ],
+)
+async def test_meeting_grant_uses_duplex_recipient_delivery(runtime, duplex_recipient, running, judgment, expected):
+    recipient = duplex_recipient
+    recipient.host.is_agent_running.return_value = running
+    if judgment == "failure":
+        recipient.classifier.classify.side_effect = RuntimeError("classifier unavailable")
+    elif judgment is not None:
+        other = "APPEND" if judgment == "INTERRUPT" else "INTERRUPT"
+        recipient.classifier.classify.return_value = {
+            "urgency": ChoiceAnswer(choice=judgment, confidence=0.97, probabilities={judgment: 0.97, other: 0.03})
+        }
+    poll = InnerEventMessage(event_type=InnerEventType.POLL_MAILBOX)
+    posted = await _post(runtime.meeting.for_member("a"))
+    await recipient.dispatcher.dispatch(poll)
+    recipient.host.deliver_input.assert_not_awaited()
+    recipient.host.harness.interrupt.assert_not_awaited()
+    recipient.factory.assert_not_called()
+    assert await runtime.db.message.get_broadcast_read_at("team", "b") == 0
+
+    lease = await runtime.meeting.grant_next()
+    # Exercise the actual published event through the dispatcher, not a manually selected handler.
+    await recipient.dispatcher.dispatch(runtime.manager.messager.publish.call_args.kwargs["message"])
+    await recipient.dispatcher.duplex_router.scheduler.wait_idle()
+    if running:
+        recipient.factory.assert_called_once()
+        recipient.classifier.classify.assert_awaited_once()
+        questions, context, messages = recipient.classifier.classify.call_args.args
+        assert questions == ("urgency",)
+        assert json.loads(context) == {"recipient": "b", "phase": "running"}
+        assert messages == [f"from a: {posted.message.content}"]
+    else:
+        recipient.factory.assert_not_called()
+        recipient.classifier.classify.assert_not_awaited()
+    if expected == "interrupt":
+        recipient.host.deliver_input.assert_not_awaited()
+        recipient.host.harness.interrupt.assert_awaited_once()
+        delivered = recipient.host.harness.interrupt.call_args.args[0]
+    else:
+        recipient.host.harness.interrupt.assert_not_awaited()
+        recipient.host.deliver_input.assert_awaited_once()
+        delivered = recipient.host.deliver_input.call_args.args[0]
+        assert recipient.host.deliver_input.call_args.kwargs == {"use_steer": expected == "deliver_now"}
+    assert posted.message.content in delivered and lease.source_message_id in delivered
+    assert posted.speech_request.speech_text not in delivered
+    assert await runtime.db.message.get_broadcast_messages("team", "b", unread_only=True) == []
+    assert (await runtime.meeting.get_speaker()).lease_token == lease.lease_token
+    assert await runtime.meeting.complete_playback(lease.lease_token)
+    await recipient.dispatcher.dispatch(poll)
+    assert recipient.host.deliver_input.await_count + recipient.host.harness.interrupt.await_count == 1
+    assert recipient.classifier.classify.await_count == int(running)
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["idle", "busy"])
+async def test_meeting_duplex_unmentioned_post_stays_visible_without_waking(runtime, duplex_recipient, running):
+    recipient = duplex_recipient
+    recipient.host.is_agent_running.return_value = running
+    posted = await _post(runtime.meeting.for_member("a"), mentions=[])
+    lease = await runtime.meeting.grant_next()
+    await recipient.dispatcher.dispatch(runtime.manager.messager.publish.call_args.kwargs["message"])
+    await recipient.dispatcher.duplex_router.scheduler.wait_idle()
+    recipient.factory.assert_not_called()
+    recipient.host.deliver_input.assert_not_awaited()
+    recipient.host.harness.interrupt.assert_not_awaited()
+    assert await runtime.db.message.get_broadcast_messages("team", "b", unread_only=True) == []
+    history = await runtime.meeting.for_member("b").get_history()
+    assert [(message.message_id, message.content) for message in history] == [
+        (lease.source_message_id, posted.message.content)
+    ]
+    assert (await runtime.meeting.get_speaker()).lease_token == lease.lease_token
+    assert await runtime.meeting.complete_playback(lease.lease_token)
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["idle", "busy"])
+async def test_meeting_duplex_human_input_bypasses_classifier_and_speech_queue(runtime, duplex_recipient, running):
+    recipient = duplex_recipient
+    recipient.host.is_agent_running.return_value = running
+    posted = await runtime.meeting.post_human_message("Human changes the discussion", mentions=["b"])
+    await recipient.dispatcher.dispatch(runtime.manager.messager.publish.call_args.kwargs["message"])
+    await recipient.dispatcher.duplex_router.scheduler.wait_idle()
+    recipient.factory.assert_not_called()
+    recipient.host.harness.interrupt.assert_not_awaited()
+    recipient.host.deliver_input.assert_awaited_once()
+    delivered = recipient.host.deliver_input.call_args.args[0]
+    assert posted.message.content in delivered and posted.message.message_id in delivered
+    assert recipient.host.deliver_input.call_args.kwargs == {"use_steer": True}
+    assert posted.speech_request is None and await runtime.meeting.get_speaker() is None
+    assert await runtime.meeting.list_pending() == ()
+    assert await runtime.db.message.get_broadcast_messages("team", "b", unread_only=True) == []
+    await recipient.dispatcher.dispatch(InnerEventMessage(event_type=InnerEventType.POLL_MAILBOX))
+    recipient.host.deliver_input.assert_awaited_once()
 
 
 async def test_notification_failure_keeps_normal_team_polling_behavior(runtime):
