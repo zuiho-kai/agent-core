@@ -1,0 +1,1 @@
+As the meeting Leader, interrupt the speaking lease you observed with meeting_get_speaker after inspecting its complete source text. Pass its lease_token as expected_token so a stale decision cannot stop a successor. The host must stop audio and acknowledge the interruption before another speaker can be granted. This stops speech without retracting text or cancelling agent work.

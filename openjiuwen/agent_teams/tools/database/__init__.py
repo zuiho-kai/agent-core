@@ -3,10 +3,10 @@
 
 """Team Database Module.
 
-``TeamDatabase`` owns the engine lifecycle and cross-table transactions
-that span more than one DAO. Single-table operations live on the DAO
+``TeamDatabase`` owns the engine lifecycle and cross-domain transactions
+that span more than one DAO. Domain operations live on the DAO
 instances exposed as attributes (``team`` / ``member`` / ``task`` /
-``message``) — call them directly instead of going through the facade.
+``message`` / ``meeting``) — call them directly instead of going through the facade.
 Model definitions live in models.py.
 """
 
@@ -55,6 +55,7 @@ from openjiuwen.agent_teams.tools.database.graph import (
 from openjiuwen.agent_teams.tools.database.graph import (
     detect_cycle_in_adjacency as detect_cycle_in_adjacency,
 )
+from openjiuwen.agent_teams.tools.database.meeting_dao import MeetingDao as MeetingDao
 from openjiuwen.agent_teams.tools.database.member_dao import MemberDao as MemberDao
 from openjiuwen.agent_teams.tools.database.member_dao import (
     MemberExecutionUpdateResult as MemberExecutionUpdateResult,
@@ -83,9 +84,10 @@ from openjiuwen.core.common.logging import team_logger
 class TeamDatabase:
     """Asynchronous team database manager.
 
-    Owns the engine lifecycle and cross-table transactions. Single-table
+    Owns the engine lifecycle and cross-domain transactions. Domain
     operations live on the DAO attributes (``team`` / ``member`` /
-    ``task`` / ``message``) — call them directly.
+    ``task`` / ``message`` / ``meeting``) — call them directly. The meeting
+    DAO owns the atomic transaction across meeting and speech-request rows.
     """
 
     def __init__(self, config: DatabaseConfig):
@@ -112,6 +114,7 @@ class TeamDatabase:
         self.member: Optional[MemberDao] = None
         self.task: Optional[TaskDao] = None
         self.message: Optional[MessageDao] = None
+        self.meeting: MeetingDao | None = None
 
     @staticmethod
     def get_current_time() -> int:
@@ -142,7 +145,7 @@ class TeamDatabase:
             self.read_session_local = engines.read_session_local
 
             # One DbSessions (one write lock) shared by every DAO: SQLite's
-            # write lock is database-wide, so all four tables must serialise
+            # write lock is database-wide, so all DAOs must serialise
             # writes through the same lock. Reads go to the reader factory
             # (a separate pool for file-backed SQLite) — see DbSessions.
             sessions = DbSessions(self.session_local, self.read_session_local)
@@ -162,6 +165,7 @@ class TeamDatabase:
             self.member = MemberDao(sessions)
             self.task = TaskDao(sessions, file_store=file_store)
             self.message = MessageDao(sessions, file_store=file_store)
+            self.meeting = MeetingDao(sessions)
 
             self._maybe_start_checkpointer()
 
@@ -304,6 +308,7 @@ class TeamDatabase:
             self.member = None
             self.task = None
             self.message = None
+            self.meeting = None
             team_logger.info("Team database closed")
         from openjiuwen.agent_teams.organization.pool import remove_process_org_managers_for_db
 

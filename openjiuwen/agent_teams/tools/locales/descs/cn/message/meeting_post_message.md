@@ -1,0 +1,1 @@
+提交会议发言，提供完整 content 和简短口语总结 speech_text，可选 mentions 指定模型输入接收者。身份和范围由宿主固定，ID 在内部生成。全文与总结保存在发言队列中，取得发言权前不写入普通消息表。返回结果的 message.message_id 为 null，published 为 false，speech_request.content 包含排队的全文。查看队列不会发送消息。取得发言权后，包装器先通过现有 Team 群聊路径发送全文，再开始播放语音；Agent 按原有机制获取消息。授予前取消或关闭不会发送；发送后打断保留已有文字。本调用不等待播放。
