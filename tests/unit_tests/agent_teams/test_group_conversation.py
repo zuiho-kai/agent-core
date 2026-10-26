@@ -1,6 +1,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Group broadcasts use the existing DB watermark, never a second inbox row."""
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,7 +19,9 @@ from openjiuwen.agent_teams.tools.team import TeamBackend
 
 @pytest_asyncio.fixture
 async def group(tmp_path, monkeypatch):
-    home = set_task_openjiuwen_home(tmp_path)
+    # Keep the unchanged workspace layout usable on Windows; leave DB paths plain.
+    workspace = Path(f"\\\\?\\{tmp_path}") if sys.platform == "win32" else tmp_path
+    home = set_task_openjiuwen_home(workspace)
     token = set_session_id("session")
     db = TeamDatabase(DatabaseConfig(connection_string=":memory:"))
     await db.initialize()
@@ -83,7 +87,7 @@ async def test_history_jsonl_keeps_multiline_content_in_one_record(group):
         group.clock["timestamp"] += 10
     await post(group, contents[0])
     log = await group.backend.group_conversation()
-    lines = log.history_path.read_text().split("\n")
+    lines = log.history_path.read_text(encoding="utf-8").split("\n")
     assert log.history_path.name == "history.jsonl"
     assert lines[-1] == ""
     assert len(lines[:-1]) == 2

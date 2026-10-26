@@ -1,6 +1,6 @@
 # S_28 群聊输入与文件归档
 
-最近修订：2026-10-10。关联特性：[F_112](../features/F_112_group-conversation-and-delegation.md)。
+最近修订：2026-10-26。关联特性：[F_112](../features/F_112_group-conversation-and-delegation.md)。
 
 ## 职责与入口
 
@@ -99,6 +99,33 @@ Agent 使用 `group_send_message(content, client_message_id, mentions=[])` 发�
 conversations/<team-scope>/<session-scope>/
   history.jsonl
 ```
+
+The existing shared workspace layout and full hashes remain unchanged. Before
+starting a meeting runtime or delivering its first group message, the host sets
+`TeamAgentSpec.conversation_history_location="session"`. Its archive then lives at
+`team_session_dir(team_name, session_id)/conversation/history.jsonl`. Other group
+sessions, workflows and worktrees retain their existing paths.
+
+The setting defaults to `None`: reopening reuses the registered location, and a
+new session uses the original workspace layout. Explicit `"workspace"` selects
+that default layout; `GroupConversationLog(history_location=...)` has the same
+selection contract. The existing registry persists the selection and workspace
+identity. Session archives add `scope.json` containing the full team/session IDs
+to reject sanitized session aliases, including empty archives. All writers use
+the existing team registry lock and atomic replacement; stale workspace writers
+must reopen after a session-storage selection. Directory, scope, history,
+registration and temporary-file redirects through symlinks are rejected.
+
+Explicit workspace-to-session selection reads validated old JSONL when the new
+projection is missing and merges it on the next synchronization. Old files remain
+until explicit cleanup. Cleanup removes both archives for the selected scope and
+preserves sibling sessions and other session state. Switching back to workspace
+storage is rejected to prevent split histories.
+
+Storage selection grants no filesystem permissions or trusted directories. Full
+archive reads still use the member/host's existing file-tool policy. SDK context
+retrieval continues to provide public excerpts from the scoped DB even if that
+policy denies direct file reads; moving the archive is not a privacy boundary.
 
 `history.jsonl` 是包含全部公开消息的 JSON Lines 文件（每行一条消息）。每条记录包含消息 ID、team/session、客户端消息 ID、发送者及显示名、正文、mentions、附件引用、毫秒时间戳。附件不复制内容。群聊原文直接保存在 DB，文件是在锁内合并消息、原子替换的可读投影；不是按消息生成独立 JSON 文件。文件丢失后可从 DB 重建。
 

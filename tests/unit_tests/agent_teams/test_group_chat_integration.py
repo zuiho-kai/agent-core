@@ -2,6 +2,7 @@
 """SDK and tool boundaries: no mention means storage only, no free routing."""
 import asyncio
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,23 +12,25 @@ import pytest_asyncio
 from sqlalchemy import text
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+from openjiuwen.agent_teams.group_chat.conversation import GroupConversationLog
+from openjiuwen.agent_teams.group_chat.tools import GroupSendMessageTool, group_chat_prompt
+from openjiuwen.agent_teams.interaction.payload import GroupChatMessage
 from openjiuwen.agent_teams.paths import reset_task_openjiuwen_home, set_task_openjiuwen_home
 from openjiuwen.agent_teams.runtime.manager import TeamRuntimeManager
 from openjiuwen.agent_teams.runtime.pool import ActiveTeam, RuntimeState
-from openjiuwen.agent_teams.schema.conversation import ConversationAppendResult
-from openjiuwen.agent_teams.interaction.payload import GroupChatMessage
 from openjiuwen.agent_teams.schema.blueprint import DeepAgentSpec, LeaderSpec, TeamAgentSpec
+from openjiuwen.agent_teams.schema.conversation import ConversationAppendResult
 from openjiuwen.agent_teams.tools.database import DatabaseConfig, TeamDatabase
-from openjiuwen.agent_teams.group_chat.conversation import GroupConversationLog
 from openjiuwen.agent_teams.tools.locales import make_translator
 from openjiuwen.agent_teams.tools.team import TeamBackend
-from openjiuwen.agent_teams.group_chat.tools import GroupSendMessageTool, group_chat_prompt
 from openjiuwen.core.runner.team_runner import _TeamRunnerMixin
 
 
 @pytest_asyncio.fixture
 async def runtime(tmp_path, monkeypatch):
-    home = set_task_openjiuwen_home(tmp_path / "home")
+    # Scope extended paths to workspace files, never SQLite connection URLs.
+    workspace = Path(f"\\\\?\\{tmp_path}") if sys.platform == "win32" else tmp_path
+    home = set_task_openjiuwen_home(workspace / "home")
     db = TeamDatabase(DatabaseConfig(connection_string=":memory:"))
     await db.initialize()
     await db.team.create_team("group", "Group", "leader")
@@ -212,8 +215,8 @@ async def test_first_group_message_registers_team_without_leader_input(runtime):
 ])
 @pytest.mark.asyncio
 async def test_group_tool_is_assembled_once_for_runtime_mode(runtime, mode, role, excluded, expected):
-    from openjiuwen.agent_teams.tools.tool_factory import create_team_tools
     from openjiuwen.agent_teams.rails.team_tool_rail import TeamToolRail
+    from openjiuwen.agent_teams.tools.tool_factory import create_team_tools
     from openjiuwen.core.single_agent.rail.base import AgentCallbackEvent
 
     runtime.backend.conversation_mode = mode
@@ -255,9 +258,9 @@ def test_runtime_mode_is_selected_only_at_entry(incoming, expected):
 
 @pytest.mark.asyncio
 async def test_group_runtime_context_and_cli_policy_keep_fixed_mode(runtime):
-    from openjiuwen.agent_teams.schema.team import TeamSpec, TeamRuntimeContext, TeamRole, TeamMemberSpec
-    from openjiuwen.agent_teams.spawn.external_cli_spawn import _build_member_system_prompt
     from openjiuwen.agent_teams.agent.payload import SpawnPayloadBuilder
+    from openjiuwen.agent_teams.schema.team import TeamMemberSpec, TeamRole, TeamRuntimeContext, TeamSpec
+    from openjiuwen.agent_teams.spawn.external_cli_spawn import _build_member_system_prompt
 
     team = TeamSpec(team_name="group", display_name="Group", conversation_mode="group_chat")
     ctx = TeamRuntimeContext(team_spec=team, role=TeamRole.LEADER, member_name="leader")
