@@ -306,6 +306,15 @@ def group_conversation_registry_dir(team_name: str) -> Path:
     return root
 
 
+def group_conversation_session_dir(team_name: str, session_id: str) -> Path:
+    """Return an opt-in public archive under the existing Team/session home."""
+    group_conversation_registry_dir(team_name)
+    path = team_session_dir(team_name, session_id).absolute() / "conversation"
+    if path.resolve() != path:
+        raise ValueError("Conversation session archive must not follow directory symlinks")
+    return path
+
+
 def group_conversation_dir(
     team_name: str,
     session_id: str,

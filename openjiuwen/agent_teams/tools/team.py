@@ -488,6 +488,7 @@ class TeamBackend:
                 self.team_name,
                 self.group_session_id,
                 workspace_path=workspace.root_path if workspace else None,
+                history_location=getattr(self.group_chat_spec, "conversation_history_location", None),
             )
         return self._group_conversation
 

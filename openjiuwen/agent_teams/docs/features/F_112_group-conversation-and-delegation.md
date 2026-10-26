@@ -222,3 +222,12 @@ jiuwenswarm 保存会话的 `conversation_mode`，在两个 Team 输入入口透
 - 撤销逐消息类型透传、XML 模式解析、消费时动态工具注册和模型请求前 schema 同步，恢复原有文本投递与队列。
 - 群聊工具与提示在装配阶段按固定模式注册，core 装配的 CLI 成员在启动时继承模式；外部业务输入不得在同一运行时切换模式。
 - 增加固定工具集、模式隔离、成员上下文继承与 CLI policy 测试；端到端覆盖群聊公开回复、框架通知与冷恢复。
+
+
+## 2026-10-26: Explicit session archive selection
+
+Ordinary group-chat workspace paths and hashes remain unchanged. Hosts select
+`TeamAgentSpec.conversation_history_location="session"` before starting a meeting
+runtime and sending its first message. The registry preserves that selection for
+reopening. The current JSONL/DB read_at contract is in S_28; the Windows failure,
+permission behavior and validation are recorded in B_03.

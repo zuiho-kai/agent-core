@@ -413,6 +413,11 @@ class TeamAgentSpec(BaseModel):
     """Optional worktree isolation config for team members."""
     workspace: Optional[TeamWorkspaceConfig] = None
     """Optional shared workspace config for team members."""
+    conversation_history_location: Literal["workspace", "session"] | None = None
+    """Public group archive location. None reuses a registered location, or the
+    existing shared-workspace layout for a new session. Hosts may explicitly opt
+    meeting sessions into team-home/sessions/<session-id>/conversation storage.
+    """
     metadata: dict[str, Any] = {}
     enable_hitt: bool = False
     """Spec-level Human-in-the-Team capability ceiling.

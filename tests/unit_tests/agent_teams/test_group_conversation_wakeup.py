@@ -3,7 +3,9 @@
 """Group mentions reuse ordinary mailbox wakeups, including transport self echoes."""
 
 import asyncio
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,7 +25,8 @@ from openjiuwen.agent_teams.tools.team import TeamBackend
 @asynccontextmanager
 async def running_coordination(tmp_path, role):
     """Keep transport, kernel filtering, dispatcher, handlers and storage real."""
-    home_token = set_task_openjiuwen_home(tmp_path)
+    workspace = Path(f"\\\\?\\{tmp_path}") if sys.platform == "win32" else tmp_path
+    home_token = set_task_openjiuwen_home(workspace)
     session_token = set_session_id("wakeup-session")
     name = "team_leader" if role == TeamRole.LEADER else "avatar"
     db = TeamDatabase(DatabaseConfig(connection_string=":memory:"))
