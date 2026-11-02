@@ -20,11 +20,20 @@ class MeetingScope:
             raise ValueError("Meeting scope identifiers must be non-empty")
 
 
+class MeetingStatus(StrEnum):
+    """Team capability lifecycle; disabling preserves the meeting identity."""
+
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    CLOSED = "closed"
+
+
 class SpeechRequestStatus(StrEnum):
     """Database coordination states; publication/audio phases belong to the coordinator."""
 
     QUEUED = "queued"
     GRANTED = "granted"
+    FLUSHING = "flushing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
@@ -51,6 +60,24 @@ class MeetingState:
     lease_token: str | None
     interruption_id: str | None
     revision: int
+    status: MeetingStatus | None = None
+
+    def __post_init__(self) -> None:
+        # Keep the existing constructor/closed observation compatible. The
+        # explicit lifecycle is authoritative when supplied by the coordinator.
+        status = MeetingStatus(self.status) if self.status is not None else (
+            MeetingStatus.CLOSED if self.closed else MeetingStatus.ACTIVE
+        )
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "closed", status == MeetingStatus.CLOSED)
+
+    @property
+    def enabled(self) -> bool:
+        return self.status == MeetingStatus.ACTIVE
+
+    @property
+    def flushing(self) -> bool:
+        return self.status == MeetingStatus.DISABLED and self.interruption_id is not None
 
 
 @dataclass(frozen=True, slots=True)

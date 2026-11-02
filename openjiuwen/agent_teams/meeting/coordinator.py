@@ -18,6 +18,7 @@ from openjiuwen.agent_teams.schema.meeting import (
     MeetingPostResult,
     MeetingScope,
     MeetingState,
+    MeetingStatus,
     SpeechInterruption,
     SpeechRequest,
     SpeechRequestStatus,
@@ -27,6 +28,8 @@ from openjiuwen.agent_teams.schema.status import MEMBER_DEPARTED_STATUSES
 from openjiuwen.agent_teams.tools.database import TeamDatabase
 from openjiuwen.agent_teams.tools.database.meeting_dao import MeetingDao
 from openjiuwen.agent_teams.tools.models import TeamMeetingBase, TeamSpeechRequestBase
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
 
 if TYPE_CHECKING:
@@ -138,8 +141,8 @@ class MeetingCoordinator:
         if self._message_manager is None or self._conversation is None:
             raise ValueError("Meeting publication requires the existing message manager and conversation")
         state = await self.get_state()
-        if state is None or state.closed:
-            raise ValueError("Meeting must exist and be open for publication")
+        if state is None or not state.enabled:
+            raise ValueError("Meeting must exist and be active for publication")
         mentions = tuple(dict.fromkeys(mentions))
         for name in mentions:
             if name == "user":
@@ -221,6 +224,7 @@ class MeetingCoordinator:
             lease_token=row.lease_token,
             interruption_id=row.interruption_id,
             revision=row.revision,
+            status=MeetingStatus(row.status),
         )
 
     async def _request(self, row: TeamSpeechRequestBase) -> SpeechRequest:
@@ -349,47 +353,51 @@ class MeetingCoordinator:
             return None
         return await self._publish_granted(await self._request(row))
 
+    async def _send_queued_text(self, request: SpeechRequest, *, recover: bool) -> str:
+        """Publish once using the request identity, independently of audio completion."""
+        if request.source_message_id is not None:
+            return request.source_message_id
+        if self._message_manager is None or self._conversation is None:
+            raise ValueError("Sending queued speech requires message manager and conversation")
+        if recover:
+            # Use the existing group submission identity only on recovery;
+            # an already committed message may outlive its members.
+            identity = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    json.dumps(
+                        [self.scope.team_name, self.scope.session_id, request.request_id], ensure_ascii=False
+                    ),
+                )
+            )
+            source = await self._get_conversation_message(identity)
+            if source is not None:
+                if (source.member_name, source.content, source.mentions) != (
+                    request.member_name,
+                    request.content,
+                    request.mentions,
+                ):
+                    raise ValueError("Stored publication does not match the queued utterance")
+                token = set_session_id(self.scope.session_id)
+                try:
+                    await sync_history(self._conversation, self._message_manager)
+                    await self._message_manager.publish_broadcast(identity, request.member_name)
+                finally:
+                    reset_session_id(token)
+                return source.message_id
+        posted = await self._send_message(
+            request.member_name, request.content, request.mentions, request.request_id
+        )
+        return posted.message.message_id
+
     async def _publish_granted(self, request: SpeechRequest, *, recover: bool = False) -> SpeechRequest | None:
         """Send only claimed queue content; ordinary reads never publish anything."""
         state = await self.get_state()
-        if state is None or state.closed or state.lease_token != request.lease_token:
+        if state is None or not state.enabled or state.lease_token != request.lease_token:
             return None
         if request.source_message_id is None:
             try:
-                if self._message_manager is None or self._conversation is None:
-                    raise ValueError("Sending queued speech requires message manager and conversation")
-                source_id = None
-                if recover:
-                    # Use the existing group submission identity only on recovery;
-                    # an already committed message may outlive its members.
-                    identity = str(
-                        uuid5(
-                            NAMESPACE_URL,
-                            json.dumps(
-                                [self.scope.team_name, self.scope.session_id, request.request_id], ensure_ascii=False
-                            ),
-                        )
-                    )
-                    source = await self._get_conversation_message(identity)
-                    if source is not None:
-                        if (source.member_name, source.content, source.mentions) != (
-                            request.member_name,
-                            request.content,
-                            request.mentions,
-                        ):
-                            raise ValueError("Stored publication does not match the queued utterance")
-                        token = set_session_id(self.scope.session_id)
-                        try:
-                            await sync_history(self._conversation, self._message_manager)
-                            await self._message_manager.publish_broadcast(identity, request.member_name)
-                        finally:
-                            reset_session_id(token)
-                        source_id = source.message_id
-                if source_id is None:
-                    posted = await self._send_message(
-                        request.member_name, request.content, request.mentions, request.request_id
-                    )
-                    source_id = posted.message.message_id
+                source_id = await self._send_queued_text(request, recover=recover)
                 # Preserve the known source in the error result if recording
                 # its durable queue link fails after sending has succeeded.
                 request = replace(request, source_message_id=source_id)
@@ -405,7 +413,7 @@ class MeetingCoordinator:
         # Sending may overlap interruption/close. Already sent text remains;
         # a revoked turn must never be returned as ready for playback.
         state = await self.get_state()
-        if state is None or state.closed or state.lease_token != request.lease_token:
+        if state is None or not state.enabled or state.lease_token != request.lease_token:
             return None
         return request
 
@@ -420,7 +428,7 @@ class MeetingCoordinator:
         """Observe the current lease; a concurrent release can make it stale immediately."""
         dao = await self._dao()
         meeting = await dao.get_meeting(self.scope)
-        if meeting is None or meeting.closed or meeting.owner_request_id is None:
+        if meeting is None or meeting.status != MeetingStatus.ACTIVE or meeting.owner_request_id is None:
             return None
         row = await dao.get_request(self.scope, meeting.owner_request_id)
         if row is None or row.status != SpeechRequestStatus.GRANTED or row.lease_token != meeting.lease_token:
@@ -458,6 +466,34 @@ class MeetingCoordinator:
         """Host confirms audio stopped and, for human interruption, input admitted."""
         dao = await self._dao()
         return await dao.resume_after_interruption(self.scope, interruption_id)
+
+    async def disable(self) -> bool:
+        """Disable audio and await FIFO publication of all remaining text.
+
+        A failed/cancelled drain retains its unsent requests and barrier. Retry
+        this operation to continue; enable is blocked until the drain finishes.
+        The host remains responsible for stopping already playing audio.
+        """
+        dao = await self._dao()
+        flush_token = await dao.begin_disable(self.scope)
+        if flush_token is None:
+            return False
+        while (row := await dao.next_flush_request(self.scope, flush_token)) is not None:
+            try:
+                request = await self._request(row)
+                source_id = await self._send_queued_text(request, recover=True)
+                if not await dao.complete_flush_request(self.scope, flush_token, request.request_id, source_id):
+                    # Close/another flush may win after sending. Already committed
+                    # text still needs its queue reference, without reviving audio.
+                    await dao.record_publication(self.scope, request.request_id, source_id)
+                    return False
+            except Exception as exc:
+                raise_error(
+                    StatusCode.AGENT_TEAM_STATE_INVALID,
+                    reason=f"Text flush failed for request {row.request_id}; retry disabling the meeting to continue",
+                    cause=exc,
+                )
+        return await dao.finish_disable(self.scope, flush_token)
 
     async def close(self) -> bool:
         """Permanently close audio coordination; caller stops audio and owns the DB."""

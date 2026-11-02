@@ -3,7 +3,8 @@
 
 """Shared database authority for meeting queues and speaking leases.
 
-Every mutation locks the meeting row with an UPDATE before reading it. Unlike
+Queue mutations lock the meeting row with an UPDATE before reading it.
+Creation/activation lock the owning Team row before checking for a live meeting. Unlike
 the local DbSessions lock, this also serializes independent member processes.
 Callers are trusted runtime code; agent tools must not expose this DAO directly.
 """
@@ -14,12 +15,17 @@ from contextlib import asynccontextmanager
 from typing import TypeVar
 from uuid import uuid4
 
-from sqlalchemy import case, inspect, select, update
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy import case, inspect, or_, select, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openjiuwen.agent_teams.schema.meeting import MeetingScope, SpeechInterruption, SpeechRequestStatus
-from openjiuwen.agent_teams.tools.database.engine import DbSessions, create_meeting_tables, get_current_time
+from openjiuwen.agent_teams.schema.meeting import MeetingScope, MeetingStatus, SpeechInterruption, SpeechRequestStatus
+from openjiuwen.agent_teams.tools.database.engine import (
+    DbSessions,
+    _ensure_meeting_lifecycle_schema,
+    create_meeting_tables,
+    get_current_time,
+)
 from openjiuwen.agent_teams.tools.models import (
     Team,
     TeamMeetingBase,
@@ -28,6 +34,8 @@ from openjiuwen.agent_teams.tools.models import (
     _get_meeting_model,
     _get_speech_request_model,
 )
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
 
 _MeetingRow = TypeVar("_MeetingRow", TeamMeetingBase, TeamSpeechRequestBase)
 
@@ -52,10 +60,27 @@ class MeetingDao:
 
     def __init__(self, sessions: DbSessions) -> None:
         self._sessions = sessions
+        self._lifecycle_schemas_ready: set[str] = set()
+
+    async def _ensure_lifecycle_schema(self, model: type[TeamMeetingBase]) -> None:
+        """Upgrade existing queues on first access, including standalone callers.
+
+        Cache schema readiness only, never active meeting state. Do not recreate
+        missing tables: late receipts after session release must remain harmless.
+        """
+        if model.__tablename__ in self._lifecycle_schemas_ready:
+            return
+        async with self._sessions.write() as session:
+            if await self._table_exists(session, model):
+                conn = await session.connection()
+                await conn.run_sync(_ensure_meeting_lifecycle_schema, model.__table__)
+            await session.commit()
+        self._lifecycle_schemas_ready.add(model.__tablename__)
 
     @asynccontextmanager
     async def _locked(self, scope: MeetingScope) -> AsyncIterator[tuple[AsyncSession, TeamMeetingBase]]:
         meeting_model = _get_meeting_model(scope.session_id)
+        await self._ensure_lifecycle_schema(meeting_model)
         try:
             async with self._sessions.write() as session:
                 # Write first: do not upgrade a stale SQLite read snapshot.
@@ -85,6 +110,8 @@ class MeetingDao:
 
     async def _get_row(self, model: type[_MeetingRow], key: dict[str, str]) -> _MeetingRow | None:
         """Read normally; inspect missing tables only for late reads after session release."""
+        if issubclass(model, TeamMeetingBase):
+            await self._ensure_lifecycle_schema(model)
         try:
             async with self._sessions.read() as session:
                 return await session.get(model, key)
@@ -95,33 +122,158 @@ class MeetingDao:
             raise
 
     async def create_meeting(self, scope: MeetingScope) -> TeamMeetingBase:
-        """Create an instance once; duplicate creation never resets persisted state."""
-        await create_meeting_tables(self._sessions, scope.session_id)
-        meeting_model = _get_meeting_model(scope.session_id)
-        async with self._sessions.write() as session:
-            existing = await session.get(meeting_model, _scope_values(scope))
-            if existing is not None:
-                return existing
-            leader = await session.scalar(select(Team.leader_member_name).where(Team.team_name == scope.team_name))
-            if leader is None:
-                raise ValueError("Team does not exist")
-            meeting = meeting_model(**_scope_values(scope), leader_member_name=leader)
-            session.add(meeting)
-            try:
-                await session.commit()
-            except IntegrityError:
-                # Another process may have created this instance concurrently.
-                await session.rollback()
-                existing = await session.get(meeting_model, _scope_values(scope))
-                if existing is None:
-                    raise
-                return existing
-            return meeting
+        """Create once without resuming a disabled or closed instance.
+
+        Standalone and Team activation share the same one-live-meeting rule.
+        """
+        return await self._create_or_enable(scope, enable=False, reuse_current=False)
 
     async def get_meeting(self, scope: MeetingScope) -> TeamMeetingBase | None:
         """Read ownership/barrier state without acquiring a write lock."""
         meeting_model = _get_meeting_model(scope.session_id)
         return await self._get_row(meeting_model, _scope_values(scope))
+
+    @staticmethod
+    async def _find_team_meeting(
+        session: AsyncSession, model: type[TeamMeetingBase], team_name: str, *, lock: bool = False,
+    ) -> TeamMeetingBase | None:
+        query = select(model).where(model.team_name == team_name, model.status != MeetingStatus.CLOSED).limit(2)
+        if lock:
+            query = query.with_for_update()
+        rows = list(await session.scalars(query))
+        if len(rows) > 1:
+            raise_error(
+                StatusCode.AGENT_TEAM_STATE_INVALID,
+                reason="Team has multiple non-closed meetings; close the obsolete instances explicitly",
+            )
+        return rows[0] if rows else None
+
+    async def _create_or_enable(
+        self, scope: MeetingScope, *, enable: bool, reuse_current: bool,
+    ) -> TeamMeetingBase:
+        await create_meeting_tables(self._sessions, scope.session_id)
+        model = _get_meeting_model(scope.session_id)
+        async with self._sessions.write() as session:
+            # Every creation path takes the Team lock, including standalone start.
+            # This serializes different requested IDs across member processes.
+            locked = await session.execute(
+                update(Team).where(Team.team_name == scope.team_name).values(team_name=Team.team_name)
+            )
+            if locked.rowcount != 1:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting requires an existing Team")
+            current = await self._find_team_meeting(session, model, scope.team_name, lock=True)
+            row = current if reuse_current and current is not None else await session.get(
+                model, _scope_values(scope), with_for_update=True,
+            )
+            if row is None:
+                if current is not None:
+                    raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Team already has a non-closed meeting")
+                leader = await session.scalar(select(Team.leader_member_name).where(Team.team_name == scope.team_name))
+                row = model(**_scope_values(scope), leader_member_name=leader)
+                session.add(row)
+            elif enable:
+                if row.status == MeetingStatus.CLOSED:
+                    raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Closed meeting IDs cannot be re-enabled")
+                if row.status == MeetingStatus.DISABLED:
+                    if row.interruption_id is not None:
+                        raise_error(
+                            StatusCode.AGENT_TEAM_STATE_INVALID,
+                            reason="Retry disabling the meeting to finish its pending text flush before enabling",
+                        )
+                    row.status = MeetingStatus.ACTIVE
+                    row.revision += 1
+            await session.commit()
+            return row
+
+    async def enable_team_meeting(
+        self, session_id: str, team_name: str, *, meeting_id: str | None = None,
+    ) -> TeamMeetingBase:
+        """Create or resume the Team/session's non-closed meeting with the same ID."""
+        scope = MeetingScope(session_id, team_name, meeting_id if meeting_id is not None else uuid4().hex)
+        return await self._create_or_enable(scope, enable=True, reuse_current=meeting_id is None)
+
+    async def get_team_meeting(self, session_id: str, team_name: str) -> TeamMeetingBase | None:
+        """Read the single active or disabled meeting; never pick ambiguous rows."""
+        model = _get_meeting_model(session_id)
+        await self._ensure_lifecycle_schema(model)
+        try:
+            async with self._sessions.read() as session:
+                return await self._find_team_meeting(session, model, team_name)
+        except DBAPIError:
+            async with self._sessions.read() as session:
+                if not await self._table_exists(session, model):
+                    return None
+            raise
+
+    async def begin_disable(self, scope: MeetingScope) -> str | None:
+        """Revoke audio and retain pending text behind a resumable flush barrier."""
+        try:
+            async with self._locked(scope) as (session, meeting):
+                if meeting.status == MeetingStatus.CLOSED:
+                    return None
+                if meeting.status == MeetingStatus.DISABLED:
+                    return meeting.interruption_id
+                owner_id = meeting.owner_request_id
+                await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
+                model = _get_speech_request_model(scope.session_id)
+                await session.execute(
+                    update(model)
+                    .where(
+                        *_scope_filter(model, scope),
+                        or_(model.status == SpeechRequestStatus.QUEUED, model.request_id == owner_id),
+                    )
+                    .values(status=SpeechRequestStatus.FLUSHING)
+                )
+                meeting.status = MeetingStatus.DISABLED
+                meeting.interruption_id = uuid4().hex
+                return meeting.interruption_id
+        except _MeetingNotFoundError:
+            return None
+
+    async def next_flush_request(self, scope: MeetingScope, flush_token: str) -> TeamSpeechRequestBase | None:
+        """Read the oldest pending text; publication happens outside the transaction."""
+        model = _get_speech_request_model(scope.session_id)
+        async with self._locked(scope) as (session, meeting):
+            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
+                return None
+            return await session.scalar(
+                select(model)
+                .where(*_scope_filter(model, scope), model.status == SpeechRequestStatus.FLUSHING)
+                .order_by(model.sequence)
+                .limit(1)
+            )
+
+    async def complete_flush_request(
+        self, scope: MeetingScope, flush_token: str, request_id: str, message_id: str,
+    ) -> bool:
+        """Record sent text and cancel its audio atomically for the current flush."""
+        model = _get_speech_request_model(scope.session_id)
+        async with self._locked(scope) as (session, meeting):
+            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
+                return False
+            row = await session.get(model, {**_scope_values(scope), "request_id": request_id})
+            if row is None or row.status != SpeechRequestStatus.FLUSHING:
+                return False
+            row.source_message_id = message_id
+            row.content = None
+            row.status = SpeechRequestStatus.INTERRUPTED if row.lease_token else SpeechRequestStatus.CANCELLED
+            return True
+
+    async def finish_disable(self, scope: MeetingScope, flush_token: str) -> bool:
+        """Finish only after all text is recorded; failed flushes remain retryable."""
+        model = _get_speech_request_model(scope.session_id)
+        async with self._locked(scope) as (session, meeting):
+            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
+                return False
+            pending = await session.scalar(
+                select(model.request_id)
+                .where(*_scope_filter(model, scope), model.status == SpeechRequestStatus.FLUSHING)
+                .limit(1)
+            )
+            if pending is not None:
+                return False
+            meeting.interruption_id = None
+            return True
 
     async def enqueue(
         self,
@@ -150,8 +302,8 @@ class MeetingDao:
             raise ValueError("Queued content must be non-empty")
         request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
-            if meeting.closed:
-                raise ValueError("Meeting is closed")
+            if meeting.status != MeetingStatus.ACTIVE:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting must be active to queue speech")
             key = {**_scope_values(scope), "request_id": request_id}
             role = await session.scalar(
                 select(TeamMember.role).where(
@@ -178,7 +330,7 @@ class MeetingDao:
         """Replace trusted routing metadata; existing FIFO positions stay unchanged."""
         addressed = json.dumps(sorted(set(member_names)))
         async with self._locked(scope) as (_, meeting):
-            if meeting.closed:
+            if meeting.status != MeetingStatus.ACTIVE:
                 return False
             meeting.addressed_members = addressed
             return True
@@ -211,7 +363,7 @@ class MeetingDao:
     async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
         """Grant one lease; message sending runs afterward in the wrapper."""
         async with self._locked(scope) as (session, meeting):
-            if meeting.closed or meeting.interruption_id or meeting.owner_request_id:
+            if meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id or meeting.owner_request_id:
                 return None
             request = await session.scalar(self._pending_query(scope, meeting).limit(1))
             if request is None:
@@ -271,7 +423,7 @@ class MeetingDao:
         """Release only the current lease after trusted publication/playback completion."""
         try:
             async with self._locked(scope) as (session, meeting):
-                if not lease_token or meeting.closed or meeting.lease_token != lease_token:
+                if not lease_token or meeting.status != MeetingStatus.ACTIVE or meeting.lease_token != lease_token:
                     return False
                 await self._release(session, scope, meeting, SpeechRequestStatus.COMPLETED)
                 return True
@@ -288,7 +440,7 @@ class MeetingDao:
         """
         try:
             async with self._locked(scope) as (session, meeting):
-                if meeting.closed or meeting.interruption_id:
+                if meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id:
                     return None
                 if expected_token is not None and (not expected_token or meeting.lease_token != expected_token):
                     return None
@@ -303,7 +455,11 @@ class MeetingDao:
         """Acknowledge audio stopped/input admitted for this exact barrier."""
         try:
             async with self._locked(scope) as (_, meeting):
-                if not interruption_id or meeting.closed or meeting.interruption_id != interruption_id:
+                if (
+                    not interruption_id
+                    or meeting.status != MeetingStatus.ACTIVE
+                    or meeting.interruption_id != interruption_id
+                ):
                     return False
                 meeting.interruption_id = None
                 return True
@@ -312,16 +468,22 @@ class MeetingDao:
 
     async def close_meeting(self, scope: MeetingScope) -> bool:
         """Permanently revoke ownership and cancel unsent operations; caller stops audio."""
-        request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
-            if meeting.closed:
+            if meeting.status == MeetingStatus.CLOSED:
                 return False
-            await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
-            await session.execute(
-                update(request_model)
-                .where(*_scope_filter(request_model, scope), request_model.status == SpeechRequestStatus.QUEUED)
-                .values(status=SpeechRequestStatus.CANCELLED)
-            )
-            meeting.closed = True
-            meeting.interruption_id = None
+            await self._stop_speech(session, scope, meeting)
+            meeting.status = MeetingStatus.CLOSED
             return True
+
+    async def _stop_speech(self, session: AsyncSession, scope: MeetingScope, meeting: TeamMeetingBase) -> None:
+        request_model = _get_speech_request_model(scope.session_id)
+        await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
+        await session.execute(
+            update(request_model)
+            .where(
+                *_scope_filter(request_model, scope),
+                request_model.status.in_((SpeechRequestStatus.QUEUED, SpeechRequestStatus.FLUSHING)),
+            )
+            .values(status=SpeechRequestStatus.CANCELLED)
+        )
+        meeting.interruption_id = None

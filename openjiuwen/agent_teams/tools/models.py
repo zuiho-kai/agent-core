@@ -19,6 +19,7 @@ from sqlmodel import Field, SQLModel
 from sqlmodel.main import SQLModelMetaclass
 
 from openjiuwen.agent_teams.context import get_session_id
+from openjiuwen.agent_teams.schema.meeting import MeetingStatus
 
 TEAM_DYNAMIC_TABLE_PREFIXES = (
     "team_task_dependency_",
@@ -118,10 +119,15 @@ class TeamMeetingBase(SQLModel):
     addressed_members: str = Field(default="[]")
     next_sequence: int = Field(default=0, sa_type=BigInteger)
     revision: int = Field(default=0, sa_type=BigInteger)
-    closed: bool = Field(default=False)
+    status: str = Field(default=MeetingStatus.ACTIVE)
     owner_request_id: str | None = Field(default=None)
     lease_token: str | None = Field(default=None)
     interruption_id: str | None = Field(default=None)
+
+    @property
+    def closed(self) -> bool:
+        """Compatibility observation; lifecycle mutations use status."""
+        return self.status == MeetingStatus.CLOSED
 
 
 class TeamSpeechRequestBase(SQLModel):

@@ -373,6 +373,19 @@ def _ensure_message_meta_column(sync_conn) -> None:
         team_logger.info("Migrated legacy message table %s: added meta column", table_name)
 
 
+def _ensure_meeting_lifecycle_schema(sync_conn: Connection, table: Table) -> None:
+    """Replace legacy closed flags with lifecycle state without reopening rows."""
+    columns = {column["name"] for column in inspect(sync_conn).get_columns(table.name)}
+    table_name = sync_conn.dialect.identifier_preparer.quote(table.name)
+    if "status" not in columns:
+        sync_conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active'")
+    if "closed" in columns:
+        # Also repair an interrupted migration on backends with auto-committing
+        # DDL. Never reopen a legacy closed row when the status column exists.
+        sync_conn.exec_driver_sql(f"UPDATE {table_name} SET status = 'closed' WHERE closed")
+        sync_conn.exec_driver_sql(f"ALTER TABLE {table_name} DROP COLUMN closed")
+
+
 def _ensure_speech_request_schema(sync_conn: Connection, table: Table) -> None:
     """Rebuild empty prototype queues; populated rows cannot be safely backfilled."""
     inspector = inspect(sync_conn)
@@ -824,6 +837,7 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
         speech_request_model,
     ):
         await conn.run_sync(model.__table__.create, checkfirst=True)
+    await conn.run_sync(_ensure_meeting_lifecycle_schema, meeting_model.__table__)
     await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
     await conn.run_sync(_ensure_message_protocol_column)
     await conn.run_sync(_ensure_message_meta_column)
@@ -843,6 +857,7 @@ async def create_meeting_tables(sessions: DbSessions, session_id: str) -> None:
             conn = await session.connection()
             for model in (message_model, meeting_model, speech_request_model):
                 await conn.run_sync(model.__table__.create, checkfirst=True)
+            await conn.run_sync(_ensure_meeting_lifecycle_schema, meeting_model.__table__)
             await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
             await session.commit()
         return True
