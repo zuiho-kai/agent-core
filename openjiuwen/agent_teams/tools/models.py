@@ -20,8 +20,11 @@ from sqlmodel.main import SQLModelMetaclass
 
 from openjiuwen.agent_teams.context import get_session_id
 from openjiuwen.agent_teams.schema.meeting import MeetingStatus
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
 
 TEAM_DYNAMIC_TABLE_PREFIXES = (
+    "team_speech_publication_",
     "team_task_dependency_",
     "team_task_",
     "team_speech_request_",
@@ -143,11 +146,24 @@ class TeamSpeechRequestBase(SQLModel):
     content: str | None = Field(default=None, sa_type=Text)
     speech_text: str = Field(nullable=False, sa_type=Text)
     mentions: str = Field(default="[]", sa_type=Text)
+    routing: str = Field(default='{"kind":"group_chat","recipients":[],"protocol":"plain"}', sa_type=Text)
     sequence: int = Field(sa_type=BigInteger)
     status: str = Field(default="queued")
     lease_token: str | None = Field(default=None)
     created_at: int = Field(sa_type=BigInteger)
     granted_at: int | None = Field(default=None, sa_type=BigInteger)
+
+
+class TeamSpeechPublicationBase(SQLModel):
+    """Every normal message produced by one queued utterance, including multicast."""
+
+    __abstract__ = True
+
+    team_name: str = Field(primary_key=True)
+    meeting_id: str = Field(primary_key=True)
+    request_id: str = Field(primary_key=True)
+    message_id: str = Field(primary_key=True)
+    position: int
 
 
 class TeamTaskBase(SQLModel):
@@ -393,6 +409,7 @@ _message_read_status_models: Dict[str, type[MessageReadStatusBase]] = {}
 _review_vote_models: Dict[str, type[TeamTaskReviewVoteBase]] = {}
 _meeting_models: dict[str, type[TeamMeetingBase]] = {}
 _speech_request_models: dict[str, type[TeamSpeechRequestBase]] = {}
+_speech_publication_models: dict[str, type[TeamSpeechPublicationBase]] = {}
 
 
 def _get_meeting_model(session_id: str | None = None) -> type[TeamMeetingBase]:
@@ -431,6 +448,35 @@ def _get_speech_request_model(session_id: str | None = None) -> type[TeamSpeechR
         model_cls = SQLModelMetaclass(f"TeamSpeechRequest_{suffix}", (TeamSpeechRequestBase,), attrs, table=True)
         _speech_request_models[session_id] = cast(type[TeamSpeechRequestBase], model_cls)
     return _speech_request_models[session_id]
+
+
+def _get_speech_publication_model(session_id: str | None = None) -> type[TeamSpeechPublicationBase]:
+    session_id = get_session_id() if session_id is None else session_id
+    if not session_id:
+        raise_error(
+            StatusCode.AGENT_TEAM_CONFIG_INVALID, reason="A session ID is required for speech publication tables",
+        )
+    if session_id not in _speech_publication_models:
+        request_table = _get_speech_request_model(session_id).__tablename__
+        message_table = _get_message_model(session_id).__tablename__
+        attrs = {
+            "__tablename__": f"team_speech_publication_{_sanitize_session_id_for_table(session_id)}",
+            "__table_args__": (
+                ForeignKeyConstraint(
+                    ["team_name", "meeting_id", "request_id"],
+                    [f"{request_table}.team_name", f"{request_table}.meeting_id", f"{request_table}.request_id"],
+                    ondelete="CASCADE",
+                ),
+                ForeignKeyConstraint(["message_id"], [f"{message_table}.message_id"], ondelete="RESTRICT"),
+                UniqueConstraint("team_name", "meeting_id", "message_id"),
+            ),
+        }
+        model = SQLModelMetaclass(
+            f"TeamSpeechPublication_{_sanitize_session_id_for_table(session_id)}",
+            (TeamSpeechPublicationBase,), attrs, table=True,
+        )
+        _speech_publication_models[session_id] = cast(type[TeamSpeechPublicationBase], model)
+    return _speech_publication_models[session_id]
 
 
 def _get_task_model() -> type[TeamTaskBase]:
@@ -600,3 +646,4 @@ def _clear_session_model_cache(session_id: str) -> None:
     _review_vote_models.pop(session_id, None)
     _meeting_models.pop(session_id, None)
     _speech_request_models.pop(session_id, None)
+    _speech_publication_models.pop(session_id, None)

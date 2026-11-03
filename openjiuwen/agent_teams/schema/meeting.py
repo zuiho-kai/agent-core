@@ -5,6 +5,19 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingRoute:
+    """Original Team publication destination, retained until grant or text flush."""
+
+    kind: Literal["direct", "multicast", "broadcast", "group_chat"] = "group_chat"
+    recipients: tuple[str, ...] = ()
+    protocol: str = "plain"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "recipients", tuple(self.recipients))
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +112,9 @@ class SpeechRequest:
     message: "SpeechSource | None" = None
     message_error: str | None = None
     delivery_error: str | None = None
+    route: MeetingRoute = MeetingRoute()
+    source_message_ids: tuple[str, ...] = ()
+    messages: tuple["SpeechSource", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,32 +129,3 @@ class SpeechSource:
     broadcast: bool
     protocol: str
     timestamp: int
-
-
-@dataclass(frozen=True, slots=True)
-class MeetingMessage:
-    """Queued utterance or public conversation message viewed through the bound scope."""
-
-    scope: MeetingScope
-    message_id: str | None
-    member_name: str
-    content: str
-    mentions: tuple[str, ...]
-    timestamp: int
-    published: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class MeetingPostResult:
-    """Queued agent utterance or immediately published human input."""
-
-    message: MeetingMessage
-    duplicate: bool
-    notified_members: tuple[str, ...]
-    speech_request: SpeechRequest | None
-    # Admission failures raise without creating a normal message.
-    audio_error: str | None = None
-
-    @property
-    def published(self) -> bool:
-        return self.message.published

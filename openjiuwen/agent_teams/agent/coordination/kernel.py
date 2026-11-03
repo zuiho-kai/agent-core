@@ -251,6 +251,8 @@ class CoordinationKernel:
             team_name = host.team_name
             if team_name and not self._subscribed_topics:
                 await self.subscribe_transport(team_name)
+                # Close the startup snapshot/subscription gap before accepting work.
+                await infra.team_backend.get_meeting()
         await self._event_bus.enqueue(InnerEventMessage(event_type=InnerEventType.REFRESH_TEAM_CONTEXT))
         # Re-arm the team-completion rising-edge guard on every start (cold
         # start / resume / recover) so each run cycle evaluates completion

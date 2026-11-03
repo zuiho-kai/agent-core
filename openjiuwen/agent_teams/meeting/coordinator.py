@@ -4,7 +4,7 @@
 """Application boundary over the shared meeting queue; no mailbox consumption."""
 
 import json
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -14,8 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
 from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message, sync_history
 from openjiuwen.agent_teams.schema.meeting import (
-    MeetingMessage,
-    MeetingPostResult,
+    MeetingRoute,
     MeetingScope,
     MeetingState,
     MeetingStatus,
@@ -54,6 +53,7 @@ class MeetingCoordinator:
         *,
         message_manager: "TeamMessageManager | None" = None,
         conversation: "GroupConversationLog | None" = None,
+        on_state_change: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if message_manager is not None and (
             message_manager.db is not database or message_manager.team_name != scope.team_name
@@ -67,9 +67,10 @@ class MeetingCoordinator:
         self._scope = scope
         self._message_manager = message_manager
         self._conversation = conversation
+        self._on_state_change = on_state_change
 
     def for_member(self, member_name: str) -> "MeetingMemberClient":
-        """Bind trusted host identity to a restricted member publication interface."""
+        """Bind trusted host identity to member inspection and interruption."""
         from openjiuwen.agent_teams.meeting.member import MeetingMemberClient
 
         if not isinstance(member_name, str) or not member_name.strip():
@@ -86,100 +87,41 @@ class MeetingCoordinator:
         ):
             raise ValueError("Meeting member must be a registered agent which has not departed")
 
-    def _message(self, row) -> MeetingMessage:
-        meta = group_metadata(row)
-        if row.team_name != self.scope.team_name or not row.broadcast or not meta:
-            raise ValueError("Message does not belong to this public conversation")
-        return MeetingMessage(
-            scope=self.scope,
-            message_id=row.message_id,
-            member_name=row.from_member_name,
-            content=row.content,
-            mentions=tuple(meta["mentions"]),
-            timestamp=row.timestamp,
-            published=row.broadcast,
-        )
+    @staticmethod
+    def _route_from_row(row) -> MeetingRoute:
+        if group_metadata(row):
+            return MeetingRoute()
+        if row.broadcast:
+            return MeetingRoute(kind="broadcast", protocol=row.protocol)
+        return MeetingRoute(kind="direct", recipients=(row.to_member_name,), protocol=row.protocol)
 
-    async def _get_conversation_message(self, message_id: str) -> MeetingMessage | None:
+    async def _read_message(self, message_id: str):
         await self._dao()
         token = set_session_id(self.scope.session_id)
         try:
-            row = await self._database.message.get_message(message_id)
+            return await self._database.message.get_message(message_id)
         finally:
             reset_session_id(token)
-        return self._message(row) if row is not None else None
 
-    async def _get_history(self, limit: int) -> tuple[MeetingMessage, ...]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-            raise ValueError("History limit must be an integer from 1 to 100")
-        await self._dao()
-        token = set_session_id(self.scope.session_id)
-        try:
-            rows = await self._database.message.get_team_messages(self.scope.team_name, broadcast=True)
-        finally:
-            reset_session_id(token)
-        rows = [row for row in rows if group_metadata(row)]
-        rows.sort(key=lambda row: (row.timestamp, row.message_id))
-        return tuple(self._message(row) for row in rows[-limit:])
-
-    async def _post_message(
-        self,
-        member_name: str,
-        content: str,
-        *,
-        speech_text: str | None,
-        mentions: tuple[str, ...] | list[str],
-    ) -> MeetingPostResult:
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("Meeting content must be nonblank text")
-        if member_name != "user" and (not isinstance(speech_text, str) or not speech_text.strip()):
-            raise ValueError("Meeting speech_text must be nonblank text")
-        if not isinstance(mentions, (list, tuple)) or len(mentions) > 100:
-            raise ValueError("mentions must be a list of at most 100 member names")
-        if any(not isinstance(name, str) or not name.strip() or len(name) > 255 for name in mentions):
-            raise ValueError("mentions must contain nonempty member names")
-        if self._message_manager is None or self._conversation is None:
-            raise ValueError("Meeting publication requires the existing message manager and conversation")
-        state = await self.get_state()
-        if state is None or not state.enabled:
-            raise ValueError("Meeting must exist and be active for publication")
-        mentions = tuple(dict.fromkeys(mentions))
-        for name in mentions:
-            if name == "user":
-                continue
-            identity = await self._database.member.get_member_role_status(name, self.scope.team_name)
-            if identity is None or identity[1] in MEMBER_DEPARTED_STATUSES:
-                raise ValueError(f"Unknown or departed group member: {name}")
-        request_id = uuid4().hex
-        if member_name == "user":
-            posted = await self._send_message(member_name, content, mentions, request_id)
-            message = await self._get_conversation_message(posted.message.message_id)
-            if message is None:
-                raise RuntimeError("Published human message is no longer available")
-            return MeetingPostResult(
-                message=message,
-                duplicate=False,
-                notified_members=tuple(posted.notified_members),
-                speech_request=None,
-            )
+    async def enqueue_message(
+        self, member_name: str, content: str, *, speech_text: str,
+        route: MeetingRoute, mentions: tuple[str, ...] = (), request_id: str | None = None,
+    ) -> SpeechRequest:
+        """Queue a message already validated by the existing Team send tool."""
+        if request_id is not None:
+            existing = await self.get_request(request_id)
+            if existing is not None:
+                if (
+                    existing.member_name, existing.content, existing.speech_text, existing.route, existing.mentions,
+                ) != (member_name, content, speech_text, route, mentions):
+                    raise ValueError("client_message_id was already used for different meeting content")
+                return existing
         dao = await self._dao()
         row = await dao.enqueue(
-            self.scope, request_id, member_name, content=content, speech_text=speech_text, mentions=mentions
+            self.scope, request_id or uuid4().hex, member_name, content=content,
+            speech_text=speech_text, mentions=mentions, route=route,
         )
-        return MeetingPostResult(
-            message=MeetingMessage(
-                scope=self.scope,
-                message_id=None,
-                member_name=member_name,
-                content=content,
-                mentions=mentions,
-                timestamp=row.created_at,
-                published=False,
-            ),
-            duplicate=False,
-            notified_members=(),
-            speech_request=await self._request(row),
-        )
+        return await self._request(row)
 
     async def _send_message(self, member_name: str, content: str, mentions: tuple[str, ...], request_id: str):
         """Use existing group storage, history, transport, and recipient acknowledgements."""
@@ -195,15 +137,6 @@ class MeetingCoordinator:
             )
         finally:
             reset_session_id(token)
-
-    async def post_human_message(
-        self,
-        content: str,
-        *,
-        mentions: tuple[str, ...] | list[str] = (),
-    ) -> MeetingPostResult:
-        """Send human text immediately through existing Team messaging."""
-        return await self._post_message("user", content, speech_text=None, mentions=mentions)
 
     @property
     def scope(self) -> MeetingScope:
@@ -228,31 +161,36 @@ class MeetingCoordinator:
         )
 
     async def _request(self, row: TeamSpeechRequestBase) -> SpeechRequest:
-        message = None
+        dao = await self._dao()
+        ids = await dao.get_publication_ids(self.scope, row.request_id)
+        ids = ids or ((row.source_message_id,) if row.source_message_id else ())
+        messages = []
         message_error = None
-        if row.source_message_id is not None:
+        for message_id in ids:
             try:
-                message = await self.get_source_message(row.source_message_id)
-                if message is None:
+                source = await self.get_source_message(message_id)
+                if source is None:
                     message_error = "source_message_unavailable"
-            except (ValueError, RuntimeError, OSError, SQLAlchemyError) as exc:
-                team_logger.warning("Meeting source lookup failed for %s: %s", row.source_message_id, exc)
+                else:
+                    messages.append(source)
+            except (ValueError, RuntimeError, OSError, SQLAlchemyError):
                 message_error = "source_message_unavailable"
+        if row.routing:
+            route = MeetingRoute(**json.loads(row.routing))
+        elif row.source_message_id:
+            source_row = await self._read_message(row.source_message_id)
+            route = self._route_from_row(source_row) if source_row is not None else MeetingRoute()
+        else:
+            route = MeetingRoute()
+        message = messages[0] if messages else None
         return SpeechRequest(
-            scope=self.scope,
-            request_id=row.request_id,
-            member_name=row.member_name,
-            source_message_id=row.source_message_id,
-            speech_text=row.speech_text,
-            sequence=row.sequence,
-            status=SpeechRequestStatus(row.status),
-            lease_token=row.lease_token,
-            created_at=row.created_at,
-            granted_at=row.granted_at,
+            scope=self.scope, request_id=row.request_id, member_name=row.member_name,
+            source_message_id=row.source_message_id, speech_text=row.speech_text, sequence=row.sequence,
+            status=SpeechRequestStatus(row.status), lease_token=row.lease_token,
+            created_at=row.created_at, granted_at=row.granted_at,
             content=message.content if message is not None else row.content,
-            mentions=tuple(json.loads(row.mentions)),
-            message=message,
-            message_error=message_error,
+            mentions=tuple(json.loads(row.mentions)), message=message, message_error=message_error,
+            route=route, source_message_ids=ids, messages=tuple(messages),
         )
 
     async def start(self) -> MeetingState:
@@ -265,6 +203,8 @@ class MeetingCoordinator:
             await self._database.create_cur_session_tables()
         finally:
             reset_session_id(token)
+        if self._on_state_change is not None:
+            await self._on_state_change()
         return state
 
     async def get_state(self) -> MeetingState | None:
@@ -303,6 +243,7 @@ class MeetingCoordinator:
                 member_name,
                 source_message_id=source_message_id,
                 speech_text=speech_text,
+                route=self._route_from_row(source),
             )
         )
 
@@ -353,42 +294,84 @@ class MeetingCoordinator:
             return None
         return await self._publish_granted(await self._request(row))
 
-    async def _send_queued_text(self, request: SpeechRequest, *, recover: bool) -> str:
-        """Publish once using the request identity, independently of audio completion."""
-        if request.source_message_id is not None:
-            return request.source_message_id
-        if self._message_manager is None or self._conversation is None:
-            raise ValueError("Sending queued speech requires message manager and conversation")
-        if recover:
-            # Use the existing group submission identity only on recovery;
-            # an already committed message may outlive its members.
-            identity = str(
-                uuid5(
-                    NAMESPACE_URL,
-                    json.dumps(
-                        [self.scope.team_name, self.scope.session_id, request.request_id], ensure_ascii=False
-                    ),
+    async def _publish_route(
+        self, member_name: str, content: str, route: MeetingRoute, mentions: tuple[str, ...],
+        request_id: str, *, recover: bool,
+    ) -> tuple[str, ...]:
+        if self._message_manager is None:
+            raise ValueError("Publication requires the Team message manager")
+        if route.kind == "group_chat":
+            if self._conversation is None:
+                raise ValueError("Group publication requires the Team conversation")
+            if recover:
+                # Use the existing group submission identity only on recovery;
+                # an already committed message may outlive its members.
+                identity = str(
+                    uuid5(
+                        NAMESPACE_URL,
+                        json.dumps(
+                            [self.scope.team_name, self.scope.session_id, request_id], ensure_ascii=False
+                        ),
+                    )
                 )
-            )
-            source = await self._get_conversation_message(identity)
-            if source is not None:
-                if (source.member_name, source.content, source.mentions) != (
-                    request.member_name,
-                    request.content,
-                    request.mentions,
-                ):
-                    raise ValueError("Stored publication does not match the queued utterance")
-                token = set_session_id(self.scope.session_id)
-                try:
-                    await sync_history(self._conversation, self._message_manager)
-                    await self._message_manager.publish_broadcast(identity, request.member_name)
-                finally:
-                    reset_session_id(token)
-                return source.message_id
-        posted = await self._send_message(
-            request.member_name, request.content, request.mentions, request.request_id
+                source = await self._read_message(identity)
+                if source is not None:
+                    if (source.team_name != self.scope.team_name or not source.broadcast
+                            or not group_metadata(source)):
+                        raise ValueError("Stored publication does not belong to this group")
+                    if (source.from_member_name, source.content, tuple(group_metadata(source)["mentions"])) != (
+                        member_name,
+                        content,
+                        mentions,
+                    ):
+                        raise ValueError("Stored publication does not match the queued utterance")
+                    token = set_session_id(self.scope.session_id)
+                    try:
+                        await sync_history(self._conversation, self._message_manager)
+                        await self._message_manager.publish_broadcast(identity, member_name)
+                    finally:
+                        reset_session_id(token)
+                    return (source.message_id,)
+            posted = await self._send_message(member_name, content, mentions, request_id)
+            return (posted.message.message_id,)
+        recipients = route.recipients if route.kind in ("direct", "multicast") else (None,)
+        ids = tuple(str(uuid5(NAMESPACE_URL, json.dumps(
+            [self.scope.team_name, self.scope.session_id, self.scope.meeting_id, request_id, route.kind, recipient],
+            ensure_ascii=False,
+        ))) for recipient in recipients)
+        token = set_session_id(self.scope.session_id)
+        try:
+            manager = self._message_manager
+            if route.kind == "direct":
+                result = await manager.send_message(
+                    content, route.recipients[0], member_name, route.protocol, message_id=ids[0],
+                )
+                sent = (result,) if result else ()
+            elif route.kind == "multicast":
+                sent = tuple(await manager.multicast_message(
+                    content, list(route.recipients), member_name, route.protocol, message_ids=list(ids),
+                ))
+            elif route.kind == "broadcast":
+                result = await manager.broadcast_message(
+                    content, member_name, message_id=ids[0], protocol=route.protocol,
+                )
+                sent = (result,) if result else ()
+            else:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Unknown queued publication route")
+            if sent != ids:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Team publication did not commit all messages")
+            return ids
+        finally:
+            reset_session_id(token)
+
+    async def _send_queued_text(self, request: SpeechRequest, *, recover: bool) -> tuple[str, ...]:
+        if request.source_message_ids:
+            return request.source_message_ids
+        if request.source_message_id is not None:
+            return (request.source_message_id,)
+        return await self._publish_route(
+            request.member_name, request.content, request.route, request.mentions, request.request_id, recover=recover,
         )
-        return posted.message.message_id
 
     async def _publish_granted(self, request: SpeechRequest, *, recover: bool = False) -> SpeechRequest | None:
         """Send only claimed queue content; ordinary reads never publish anything."""
@@ -400,7 +383,7 @@ class MeetingCoordinator:
                 source_id = await self._send_queued_text(request, recover=recover)
                 # Preserve the known source in the error result if recording
                 # its durable queue link fails after sending has succeeded.
-                request = replace(request, source_message_id=source_id)
+                request = replace(request, source_message_id=source_id[0], source_message_ids=source_id)
                 dao = await self._dao()
                 await dao.record_publication(self.scope, request.request_id, source_id)
                 updated = await self.get_request(request.request_id)
@@ -478,6 +461,8 @@ class MeetingCoordinator:
         flush_token = await dao.begin_disable(self.scope)
         if flush_token is None:
             return False
+        if self._on_state_change is not None:
+            await self._on_state_change()
         while (row := await dao.next_flush_request(self.scope, flush_token)) is not None:
             try:
                 request = await self._request(row)
@@ -498,4 +483,7 @@ class MeetingCoordinator:
     async def close(self) -> bool:
         """Permanently close audio coordination; caller stops audio and owns the DB."""
         dao = await self._dao()
-        return await dao.close_meeting(self.scope)
+        closed = await dao.close_meeting(self.scope)
+        if closed and self._on_state_change is not None:
+            await self._on_state_change()
+        return closed

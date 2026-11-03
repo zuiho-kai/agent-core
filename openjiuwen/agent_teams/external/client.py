@@ -167,6 +167,16 @@ class ExternalTeamClient:
         """
         return self._tools
 
+    @property
+    def meeting_enabled(self) -> bool:
+        return self._backend.meeting_enabled if self._backend is not None else False
+
+    async def _on_team_event(self, event) -> None:
+        from openjiuwen.agent_teams.schema.events import TeamEvent
+
+        if event.event_type == TeamEvent.MEETING_STATE_CHANGED:
+            await self._backend.get_meeting()
+
     def bind_session_context(self) -> None:
         """Re-assert the session-id + language contextvars for this call.
 
@@ -234,6 +244,14 @@ class ExternalTeamClient:
         self._messages = backend.message_manager
         self._db = db
 
+        if transport_config.backend != "hybrid":
+            from openjiuwen.agent_teams.schema.events import TeamTopic
+
+            await self._messager.subscribe(
+                TeamTopic.TEAM.build(self.session_id, self.team_name), self._on_team_event,
+            )
+        await backend.get_meeting()
+
         if self._descriptor.scope == "member":
             # Build the workspace manager + resident cache BEFORE creating team
             # tools — ``create_team_tools`` reads ``backend.workspace_cache``
@@ -269,6 +287,10 @@ class ExternalTeamClient:
     async def close(self) -> None:
         """Stop the messager and release owned resources. Idempotent."""
         if self._messager is not None:
+            if self._descriptor.transport_config.backend != "hybrid":
+                from openjiuwen.agent_teams.schema.events import TeamTopic
+
+                await self._messager.unsubscribe(TeamTopic.TEAM.build(self.session_id, self.team_name))
             await self._messager.stop()
             self._messager = None
         self._tasks = None

@@ -12,6 +12,7 @@ Callers are trusted runtime code; agent tools must not expose this DAO directly.
 import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import TypeVar
 from uuid import uuid4
 
@@ -19,10 +20,17 @@ from sqlalchemy import case, inspect, or_, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openjiuwen.agent_teams.schema.meeting import MeetingScope, MeetingStatus, SpeechInterruption, SpeechRequestStatus
+from openjiuwen.agent_teams.schema.meeting import (
+    MeetingRoute,
+    MeetingScope,
+    MeetingStatus,
+    SpeechInterruption,
+    SpeechRequestStatus,
+)
 from openjiuwen.agent_teams.tools.database.engine import (
     DbSessions,
     _ensure_meeting_lifecycle_schema,
+    _ensure_speech_request_schema,
     create_meeting_tables,
     get_current_time,
 )
@@ -30,8 +38,10 @@ from openjiuwen.agent_teams.tools.models import (
     Team,
     TeamMeetingBase,
     TeamMember,
+    TeamSpeechPublicationBase,
     TeamSpeechRequestBase,
     _get_meeting_model,
+    _get_speech_publication_model,
     _get_speech_request_model,
 )
 from openjiuwen.core.common.exception.codes import StatusCode
@@ -44,7 +54,9 @@ class _MeetingNotFoundError(ValueError):
     """An explicit scope no longer has persisted coordination state."""
 
 
-def _scope_filter(model: type[TeamMeetingBase] | type[TeamSpeechRequestBase], scope: MeetingScope) -> tuple:
+def _scope_filter(
+    model: type[TeamMeetingBase] | type[TeamSpeechRequestBase] | type[TeamSpeechPublicationBase], scope: MeetingScope,
+) -> tuple:
     return (
         model.team_name == scope.team_name,
         model.meeting_id == scope.meeting_id,
@@ -62,25 +74,28 @@ class MeetingDao:
         self._sessions = sessions
         self._lifecycle_schemas_ready: set[str] = set()
 
-    async def _ensure_lifecycle_schema(self, model: type[TeamMeetingBase]) -> None:
+    async def _ensure_lifecycle_schema(self, session_id: str) -> None:
         """Upgrade existing queues on first access, including standalone callers.
 
         Cache schema readiness only, never active meeting state. Do not recreate
         missing tables: late receipts after session release must remain harmless.
         """
+        model = _get_meeting_model(session_id)
         if model.__tablename__ in self._lifecycle_schemas_ready:
             return
         async with self._sessions.write() as session:
             if await self._table_exists(session, model):
                 conn = await session.connection()
                 await conn.run_sync(_ensure_meeting_lifecycle_schema, model.__table__)
+                await conn.run_sync(_ensure_speech_request_schema, _get_speech_request_model(session_id).__table__)
+                await conn.run_sync(_get_speech_publication_model(session_id).__table__.create, checkfirst=True)
             await session.commit()
         self._lifecycle_schemas_ready.add(model.__tablename__)
 
     @asynccontextmanager
     async def _locked(self, scope: MeetingScope) -> AsyncIterator[tuple[AsyncSession, TeamMeetingBase]]:
         meeting_model = _get_meeting_model(scope.session_id)
-        await self._ensure_lifecycle_schema(meeting_model)
+        await self._ensure_lifecycle_schema(scope.session_id)
         try:
             async with self._sessions.write() as session:
                 # Write first: do not upgrade a stale SQLite read snapshot.
@@ -104,14 +119,18 @@ class MeetingDao:
             raise
 
     @staticmethod
-    async def _table_exists(session: AsyncSession, model: type[TeamMeetingBase] | type[TeamSpeechRequestBase]) -> bool:
+    async def _table_exists(
+        session: AsyncSession,
+        model: type[TeamMeetingBase] | type[TeamSpeechRequestBase] | type[TeamSpeechPublicationBase],
+    ) -> bool:
         conn = await session.connection()
         return await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table(model.__tablename__))
 
-    async def _get_row(self, model: type[_MeetingRow], key: dict[str, str]) -> _MeetingRow | None:
+    async def _get_row(
+        self, model: type[_MeetingRow], key: dict[str, str], *, session_id: str,
+    ) -> _MeetingRow | None:
         """Read normally; inspect missing tables only for late reads after session release."""
-        if issubclass(model, TeamMeetingBase):
-            await self._ensure_lifecycle_schema(model)
+        await self._ensure_lifecycle_schema(session_id)
         try:
             async with self._sessions.read() as session:
                 return await session.get(model, key)
@@ -131,7 +150,7 @@ class MeetingDao:
     async def get_meeting(self, scope: MeetingScope) -> TeamMeetingBase | None:
         """Read ownership/barrier state without acquiring a write lock."""
         meeting_model = _get_meeting_model(scope.session_id)
-        return await self._get_row(meeting_model, _scope_values(scope))
+        return await self._get_row(meeting_model, _scope_values(scope), session_id=scope.session_id)
 
     @staticmethod
     async def _find_team_meeting(
@@ -195,7 +214,7 @@ class MeetingDao:
     async def get_team_meeting(self, session_id: str, team_name: str) -> TeamMeetingBase | None:
         """Read the single active or disabled meeting; never pick ambiguous rows."""
         model = _get_meeting_model(session_id)
-        await self._ensure_lifecycle_schema(model)
+        await self._ensure_lifecycle_schema(session_id)
         try:
             async with self._sessions.read() as session:
                 return await self._find_team_meeting(session, model, team_name)
@@ -244,7 +263,7 @@ class MeetingDao:
             )
 
     async def complete_flush_request(
-        self, scope: MeetingScope, flush_token: str, request_id: str, message_id: str,
+        self, scope: MeetingScope, flush_token: str, request_id: str, message_id: str | tuple[str, ...],
     ) -> bool:
         """Record sent text and cancel its audio atomically for the current flush."""
         model = _get_speech_request_model(scope.session_id)
@@ -254,8 +273,7 @@ class MeetingDao:
             row = await session.get(model, {**_scope_values(scope), "request_id": request_id})
             if row is None or row.status != SpeechRequestStatus.FLUSHING:
                 return False
-            row.source_message_id = message_id
-            row.content = None
+            await self._record_publications(session, scope, row, message_id)
             row.status = SpeechRequestStatus.INTERRUPTED if row.lease_token else SpeechRequestStatus.CANCELLED
             return True
 
@@ -285,6 +303,7 @@ class MeetingDao:
         content: str | None = None,
         mentions: Iterable[str] = (),
         source_message_id: str | None = None,
+        route: MeetingRoute | None = None,
     ) -> TeamSpeechRequestBase:
         """Queue full text and summary, or reference an already sent source.
 
@@ -320,6 +339,7 @@ class MeetingDao:
                 content=content,
                 speech_text=speech_text,
                 mentions=json.dumps(list(mentions)),
+                routing=json.dumps(asdict(route or MeetingRoute())),
                 sequence=meeting.next_sequence,
                 created_at=get_current_time(),
             )
@@ -358,7 +378,9 @@ class MeetingDao:
     async def get_request(self, scope: MeetingScope, request_id: str) -> TeamSpeechRequestBase | None:
         """Read a queued, granted, or terminal request for inspection/completion."""
         request_model = _get_speech_request_model(scope.session_id)
-        return await self._get_row(request_model, {**_scope_values(scope), "request_id": request_id})
+        return await self._get_row(
+            request_model, {**_scope_values(scope), "request_id": request_id}, session_id=scope.session_id,
+        )
 
     async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
         """Grant one lease; message sending runs afterward in the wrapper."""
@@ -375,19 +397,57 @@ class MeetingDao:
             meeting.lease_token = request.lease_token
             return request
 
-    async def record_publication(self, scope: MeetingScope, request_id: str, message_id: str) -> None:
-        """Replace queued full text with the message reference after normal sending.
+    async def get_publication_ids(self, scope: MeetingScope, request_id: str) -> tuple[str, ...]:
+        await self._ensure_lifecycle_schema(scope.session_id)
+        model = _get_speech_publication_model(scope.session_id)
+        try:
+            async with self._sessions.read() as session:
+                ids = await session.scalars(
+                    select(model.message_id)
+                    .where(*_scope_filter(model, scope), model.request_id == request_id)
+                    .order_by(model.position)
+                )
+                return tuple(ids)
+        except DBAPIError:
+            async with self._sessions.read() as session:
+                if not await self._table_exists(session, model):
+                    return ()
+            raise
 
-        Sending may overlap an interruption. Record the resulting message even
-        then; text already sent remains published while playback is revoked.
-        """
-        request_model = _get_speech_request_model(scope.session_id)
+    async def record_publication(
+        self, scope: MeetingScope, request_id: str, message_id: str | tuple[str, ...],
+    ) -> None:
+        """Record all normal message references, even after audio revocation."""
+        model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, _):
-            await session.execute(
-                update(request_model)
-                .where(*_scope_filter(request_model, scope), request_model.request_id == request_id)
-                .values(source_message_id=message_id, content=None)
-            )
+            row = await session.get(model, {**_scope_values(scope), "request_id": request_id})
+            if row is not None:
+                await self._record_publications(session, scope, row, message_id)
+
+    @staticmethod
+    async def _record_publications(
+        session: AsyncSession, scope: MeetingScope, row: TeamSpeechRequestBase, message_id: str | tuple[str, ...],
+    ) -> None:
+        ids = (message_id,) if isinstance(message_id, str) else tuple(message_id)
+        if not ids or len(ids) != len(set(ids)) or any(not value for value in ids):
+            raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Publication requires distinct message IDs")
+        model = _get_speech_publication_model(scope.session_id)
+        existing = tuple(await session.scalars(
+            select(model.message_id)
+            .where(*_scope_filter(model, scope), model.request_id == row.request_id)
+            .order_by(model.position)
+        ))
+        if existing and existing != ids:
+            raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Request already has different publication IDs")
+        if row.source_message_id is not None and row.source_message_id != ids[0]:
+            raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Request source cannot change after publication")
+        if not existing:
+            for position, value in enumerate(ids):
+                session.add(model(
+                    **_scope_values(scope), request_id=row.request_id, message_id=value, position=position,
+                ))
+        row.source_message_id = ids[0]
+        row.content = None
 
     async def cancel_request(self, scope: MeetingScope, request_id: str) -> bool:
         """Cancel only a queued operation; never retract a granted/published message."""

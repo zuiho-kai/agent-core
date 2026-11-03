@@ -109,6 +109,7 @@ class TeamEvent:
     CLEANED = "team_cleaned"
     STANDBY = "team_standby"
     TEAM_COMPLETED = "team_completed"
+    MEETING_STATE_CHANGED = "meeting_state_changed"
 
     # Member lifecycle events
     MEMBER_SPAWNED = "member_spawned"
@@ -192,6 +193,10 @@ class TeamCreatedEvent(BaseEventMessage):
 class TeamCleanedEvent(BaseEventMessage):
     """Event published when a team is cleaned up"""
     pass
+
+
+class MeetingStateChangedEvent(BaseEventMessage):
+    """The persisted Team/session meeting state changed; runtime owners reload it."""
 
 
 class TeamStandbyEvent(BaseEventMessage):
@@ -711,6 +716,7 @@ _EVENT_TYPE_MAP: Dict[str, Type[BaseEventMessage]] = {  # event_type -> model cl
     TeamEvent.CLEANED: TeamCleanedEvent,
     TeamEvent.STANDBY: TeamStandbyEvent,
     TeamEvent.TEAM_COMPLETED: TeamCompletedEvent,
+    TeamEvent.MEETING_STATE_CHANGED: MeetingStateChangedEvent,
     TeamEvent.MEMBER_SPAWNED: MemberSpawnedEvent,
     TeamEvent.MEMBER_RESTARTED: MemberRestartedEvent,
     TeamEvent.MEMBER_STATUS_CHANGED: MemberStatusChangedEvent,

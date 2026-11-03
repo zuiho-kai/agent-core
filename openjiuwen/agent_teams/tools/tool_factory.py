@@ -339,6 +339,11 @@ def create_team_tools(
         allowed = allowed - exclude_tools
     tools = [tool for name, tool in all_tools.items() if name in allowed]
 
+    if role == "human_agent":
+        all_tools["send_message"].meeting_audio = False
+    from openjiuwen.agent_teams.meeting.tools import configure_meeting_tool_schemas
+
+    configure_meeting_tool_schemas(tools, meeting_enabled=agent_team.meeting_enabled)
     for tool in tools:
         _wrap_invoke_with_logging(tool)
 

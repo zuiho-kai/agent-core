@@ -1,10 +1,11 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Explicit member toolset; install in place of unrestricted message tools."""
+"""Meeting inspection and playback control; posting uses the Team send tools."""
 
+from collections.abc import Iterable
 from dataclasses import asdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -14,6 +15,33 @@ from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.core.foundation.tool.base import ToolCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
+
+if TYPE_CHECKING:
+    from openjiuwen.core.foundation.tool.base import Tool
+
+
+def configure_meeting_tool_schemas(tools: Iterable["Tool"], *, meeting_enabled: bool) -> list["Tool"]:
+    """Expose speech_text on the existing send tools only while meeting is enabled."""
+    changed = []
+    for tool in tools:
+        if tool.card.name not in ("send_message", "group_send_message") or not tool.meeting_audio:
+            continue
+        schema = tool.card.input_params
+        if ("speech_text" in schema["properties"]) == meeting_enabled:
+            continue
+        properties = dict(schema["properties"])
+        required = [name for name in schema["required"] if name != "speech_text"]
+        if meeting_enabled:
+            properties["speech_text"] = {
+                "type": "string", "minLength": 1,
+                "description": tool.t("send_message", "speech_text"),
+            }
+            required.append("speech_text")
+        else:
+            properties.pop("speech_text", None)
+        tool.card.input_params = {**schema, "properties": properties, "required": required}
+        changed.append(tool)
+    return changed
 
 
 class _MeetingTool(TeamTool):
@@ -37,47 +65,6 @@ class _MeetingTool(TeamTool):
 
     async def _run(self, inputs: dict[str, Any]) -> Any:
         raise NotImplementedError
-
-
-class MeetingPostMessageTool(_MeetingTool):
-    def __init__(self, client: MeetingMemberClient, t: Translator) -> None:
-        super().__init__(
-            client,
-            t,
-            "meeting_post_message",
-            {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "minLength": 1},
-                    "speech_text": {"type": "string", "minLength": 1},
-                    "mentions": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
-                },
-                "required": ["content", "speech_text"],
-                "additionalProperties": False,
-            },
-        )
-
-    async def _run(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        return asdict(await self._client.post_message(**inputs))
-
-
-class MeetingReadHistoryTool(_MeetingTool):
-    def __init__(self, client: MeetingMemberClient, t: Translator) -> None:
-        super().__init__(
-            client,
-            t,
-            "meeting_read_history",
-            {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
-                },
-                "additionalProperties": False,
-            },
-        )
-
-    async def _run(self, inputs: dict[str, Any]) -> list[dict[str, Any]]:
-        return [asdict(item) for item in await self._client.get_history(**inputs)]
 
 
 class MeetingGetSpeakerTool(_MeetingTool):
@@ -124,16 +111,12 @@ async def create_meeting_tools(
     *,
     language: str = "en",
 ) -> dict[str, TeamTool]:
-    """Build scoped publication, history, speaker reads, and Leader interruption.
-
-    Install these instead of send_message/group_send_message in a meeting runtime.
-    TeamSpec assembly, external MCP wiring, and final-reply interception are separate.
-    """
+    """Build speaker inspection and Leader interruption alongside Team messaging."""
     state = await client.get_state()
     if state is None:
         raise ValueError("Meeting must exist before constructing member tools")
     t = make_translator(language)
-    tools = [MeetingPostMessageTool(client, t), MeetingReadHistoryTool(client, t), MeetingGetSpeakerTool(client, t)]
+    tools = [MeetingGetSpeakerTool(client, t)]
     if client.member_name == state.leader_member_name:
         tools.append(MeetingInterruptSpeechTool(client, t))
     return {tool.card.name: tool for tool in tools}

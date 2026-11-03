@@ -36,6 +36,7 @@ from openjiuwen.agent_teams.interaction.bridge_protocol import BridgeProtocolAda
 from openjiuwen.agent_teams.messager import Messager
 from openjiuwen.agent_teams.schema.events import (
     EventMessage,
+    MeetingStateChangedEvent,
     MemberCanceledEvent,
     MemberShutdownEvent,
     MemberSpawnedEvent,
@@ -44,7 +45,7 @@ from openjiuwen.agent_teams.schema.events import (
     TeamTopic,
     ToolApprovalResultEvent,
 )
-from openjiuwen.agent_teams.schema.meeting import MeetingScope
+from openjiuwen.agent_teams.schema.meeting import MeetingScope, MeetingStatus
 from openjiuwen.agent_teams.schema.status import (
     MEMBER_SETTLED_STATUSES,
     ExecutionStatus,
@@ -248,6 +249,7 @@ class TeamBackend:
         # Local handle only; get_meeting() refreshes the authoritative DB state
         # so separate member processes observe the same Team/session capability.
         self.meeting: "MeetingCoordinator | None" = None
+        self.meeting_enabled = False
         self.member_name = member_name
         self.is_leader = is_leader
         self.leader_member_name = str(leader_member_name or (member_name if is_leader else "")).strip()
@@ -485,6 +487,7 @@ class TeamBackend:
             raise ValueError("A group backend cannot switch sessions; stop and rebuild the team")
         if self.group_session_id != session_id:
             self.meeting = None
+            self.meeting_enabled = False
         self.group_session_id = session_id
 
     def _meeting_session_id(self) -> str:
@@ -504,6 +507,7 @@ class TeamBackend:
             conversation = await self.group_conversation() if self.conversation_mode == "group_chat" else None
             self.meeting = MeetingCoordinator(
                 self.db, scope, message_manager=self.message_manager, conversation=conversation,
+                on_state_change=self._on_meeting_state_change,
             )
         return self.meeting
 
@@ -524,7 +528,17 @@ class TeamBackend:
         row = await self.db.meeting.enable_team_meeting(
             session_id, self.team_name, meeting_id=meeting_id,
         )
-        return await self._meeting_coordinator(self._meeting_scope(row.meeting_id))
+        meeting = await self._meeting_coordinator(self._meeting_scope(row.meeting_id))
+        await self._on_meeting_state_change()
+        return meeting
+
+    async def _on_meeting_state_change(self) -> None:
+        await self.get_meeting()
+        if self.messager is not None:
+            await self.messager.publish(
+                topic_id=TeamTopic.TEAM.build(self._meeting_session_id(), self.team_name),
+                message=EventMessage.from_event(MeetingStateChangedEvent(team_name=self.team_name)),
+            )
 
     async def get_meeting(self) -> "MeetingCoordinator | None":
         """Refresh the active or disabled meeting from shared Team/session storage.
@@ -532,8 +546,8 @@ class TeamBackend:
         Member backends may discover the attachment; enable/disable through the
         backend is leader-only. The returned coordinator remains a trusted host
         API, not an agent tool. Use this method instead of trusting a cached field
-        after another process may have toggled meeting. Read get_state().enabled
-        to distinguish active from disabled; existence alone is not button state.
+        after another process may have toggled meeting. Startup/reload and state
+        change events use this to initialize meeting_enabled and the cached handle.
         Does not create a row, start audio, or acquire a speaking lease.
         """
         session_id = self._meeting_session_id()
@@ -541,8 +555,11 @@ class TeamBackend:
         row = await self.db.meeting.get_team_meeting(session_id, self.team_name)
         if row is None:
             self.meeting = None
+            self.meeting_enabled = False
             return None
-        return await self._meeting_coordinator(self._meeting_scope(row.meeting_id))
+        meeting = await self._meeting_coordinator(self._meeting_scope(row.meeting_id))
+        self.meeting_enabled = row.status == MeetingStatus.ACTIVE
+        return meeting
 
     async def disable_meeting(self, *, meeting_id: str) -> bool:
         """Disable the observed meeting without discarding its identity.

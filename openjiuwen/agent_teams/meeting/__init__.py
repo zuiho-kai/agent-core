@@ -7,8 +7,7 @@ from openjiuwen.agent_teams.meeting.coordinator import MeetingCoordinator
 from openjiuwen.agent_teams.meeting.member import MeetingMemberClient
 from openjiuwen.agent_teams.meeting.tools import create_meeting_tools
 from openjiuwen.agent_teams.schema.meeting import (
-    MeetingMessage,
-    MeetingPostResult,
+    MeetingRoute,
     MeetingScope,
     MeetingState,
     MeetingStatus,
@@ -21,8 +20,7 @@ from openjiuwen.agent_teams.schema.meeting import (
 __all__ = [
     "MeetingCoordinator",
     "MeetingMemberClient",
-    "MeetingMessage",
-    "MeetingPostResult",
+    "MeetingRoute",
     "create_meeting_tools",
     "MeetingScope",
     "MeetingState",

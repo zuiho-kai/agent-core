@@ -26,8 +26,7 @@ from openjiuwen.agent_teams.schema.deep_agent_spec import (
     WorkspaceSpec,
 )
 from openjiuwen.agent_teams.schema.meeting import (
-    MeetingMessage,
-    MeetingPostResult,
+    MeetingRoute,
     MeetingScope,
     MeetingState,
     MeetingStatus,
@@ -53,8 +52,7 @@ __all__ = [
     "DeepAgentSpec",
     "LeaderSpec",
     "MeetingScope",
-    "MeetingMessage",
-    "MeetingPostResult",
+    "MeetingRoute",
     "MeetingState",
     "MeetingStatus",
     "SpeechInterruption",

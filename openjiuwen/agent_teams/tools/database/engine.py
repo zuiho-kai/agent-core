@@ -32,6 +32,7 @@ from openjiuwen.agent_teams.tools.models import (
     _get_message_model,
     _get_message_read_status_model,
     _get_review_vote_model,
+    _get_speech_publication_model,
     _get_speech_request_model,
     _get_task_dependency_model,
     _get_task_model,
@@ -200,6 +201,12 @@ async def retry_on_locked(
             )
             await asyncio.sleep(delay)
     return on_locked_result
+
+
+def _meeting_drop_order(name: str) -> int:
+    if name.startswith("team_speech_publication_"):
+        return 0
+    return 1 if name.startswith("team_speech_request_") else 2
 
 
 def _get_table_names(sync_conn) -> list[str]:
@@ -395,6 +402,9 @@ def _ensure_speech_request_schema(sync_conn: Connection, table: Table) -> None:
     if {"source_message_id", "speech_text", "content", "mentions"} <= columns.keys() and columns[
         "source_message_id"
     ]["nullable"]:
+        if "routing" not in columns:
+            table_name = sync_conn.dialect.identifier_preparer.quote(table.name)
+            sync_conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN routing TEXT")
         return
     if sync_conn.execute(select(table.c.request_id).limit(1)).first() is not None:
         reason = (
@@ -839,6 +849,7 @@ async def _ensure_session_tables(session: AsyncSession) -> None:
         await conn.run_sync(model.__table__.create, checkfirst=True)
     await conn.run_sync(_ensure_meeting_lifecycle_schema, meeting_model.__table__)
     await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
+    await conn.run_sync(_get_speech_publication_model().__table__.create, checkfirst=True)
     await conn.run_sync(_ensure_message_protocol_column)
     await conn.run_sync(_ensure_message_meta_column)
     await conn.run_sync(
@@ -859,6 +870,7 @@ async def create_meeting_tables(sessions: DbSessions, session_id: str) -> None:
                 await conn.run_sync(model.__table__.create, checkfirst=True)
             await conn.run_sync(_ensure_meeting_lifecycle_schema, meeting_model.__table__)
             await conn.run_sync(_ensure_speech_request_schema, speech_request_model.__table__)
+            await conn.run_sync(_get_speech_publication_model(session_id).__table__.create, checkfirst=True)
             await session.commit()
         return True
 
@@ -956,6 +968,7 @@ async def drop_cur_session_tables(engine: AsyncEngine) -> None:
         for model in (
             task_model,
             dep_model,
+            _get_speech_publication_model(session_id),
             speech_request_model,
             message_model,
             read_status_model,
@@ -983,7 +996,7 @@ async def cleanup_all_runtime_state(
     async with engine.begin() as conn:
         table_names = await conn.run_sync(_get_table_names)
 
-        for table_name in sorted(table_names, key=lambda name: not name.startswith("team_speech_request_")):
+        for table_name in sorted(table_names, key=_meeting_drop_order):
             if not table_name.startswith(TEAM_DYNAMIC_TABLE_PREFIXES):
                 continue
             await conn.run_sync(_drop_table, table_name)

@@ -251,6 +251,9 @@ def build_server(
     async def list_tools() -> list[types.Tool]:
         client = await holder.get()
         if client.scope == "member":
+            from openjiuwen.agent_teams.meeting.tools import configure_meeting_tool_schemas
+
+            configure_meeting_tool_schemas(client.tools.values(), meeting_enabled=client.meeting_enabled)
             # Real teammate tools only — inbound messages are pushed to the
             # member by the parent process's coordination layer, so the
             # operator-only read_inbox pull tool is deliberately absent.

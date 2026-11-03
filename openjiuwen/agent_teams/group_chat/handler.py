@@ -69,9 +69,9 @@ async def context_for(backend, member_name: str, trigger) -> str:
     )
 
 
-async def post_message(conversation, message_manager, sender: str, content: str, *, client_message_id: str,
+async def prepare_message(conversation, message_manager, sender: str, content: str, *, client_message_id: str,
                        mentions=(), attachments=()):
-    """Persist one broadcast, project history, then publish the existing broadcast event."""
+    """Validate and normalize a group message before queueing or normal publication."""
     from openjiuwen.agent_teams.context import reset_session_id, set_session_id
     from openjiuwen.agent_teams.schema.status import MEMBER_DEPARTED_STATUSES
 
@@ -108,6 +108,24 @@ async def post_message(conversation, message_manager, sender: str, content: str,
                 targets.append(name)
         meta = dict(type="group_chat", client_message_id=client_message_id,
                     sender_name=author.display_name if author else "user", mentions=mentions, attachments=attachments)
+        return meta, targets
+    finally:
+        reset_session_id(token)
+
+
+async def post_message(conversation, message_manager, sender: str, content: str, *, client_message_id: str,
+                       mentions=(), attachments=()):
+    """Persist one broadcast, project history, then publish the existing broadcast event."""
+    from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+
+    meta, targets = await prepare_message(
+        conversation, message_manager, sender, content, client_message_id=client_message_id,
+        mentions=mentions, attachments=attachments,
+    )
+    mentions, attachments = meta["mentions"], meta["attachments"]
+    db = message_manager.db
+    token = set_session_id(conversation.session_id)
+    try:
         identity = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
             [conversation.team_name, conversation.session_id, client_message_id], ensure_ascii=False)))
         await db.create_cur_session_tables()

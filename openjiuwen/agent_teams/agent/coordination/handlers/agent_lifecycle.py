@@ -37,6 +37,7 @@ class AgentLifecycleHandler(BaseCoordinationHandler):
         # Lifecycle (TeamEvent members are bare str constants, no .value)
         TeamEvent.STANDBY: "on_standby",
         TeamEvent.CLEANED: "on_cleaned",
+        TeamEvent.MEETING_STATE_CHANGED: "on_meeting_state_changed",
         # Tool approval
         TeamEvent.TOOL_APPROVAL_RESULT: "on_tool_approval_result",
         TeamEvent.TASK_PLAN_RESPONSE: "on_task_plan_response",
@@ -53,6 +54,11 @@ class AgentLifecycleHandler(BaseCoordinationHandler):
         content = event.payload.get("content", "")
         team_logger.info("user_input → deliver_input")
         await self._round.deliver_input(content)
+
+    async def on_meeting_state_changed(self, event: EventMessage) -> None:
+        """Reload the local runtime flag after another process toggles meeting."""
+        if self._infra.team_backend is not None:
+            await self._infra.team_backend.get_meeting()
 
     async def on_standby(self, event: EventMessage) -> None:
         """Pause periodic polling on TEAM_STANDBY."""

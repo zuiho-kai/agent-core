@@ -104,6 +104,7 @@ class SessionManager:
 
         if team_backend:
             await team_backend.db.create_cur_session_tables()
+            await team_backend.get_meeting()
 
         spec = self._configurator.spec
         if spec and self._configurator.role == TeamRole.LEADER:
