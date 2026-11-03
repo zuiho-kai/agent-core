@@ -67,11 +67,16 @@ class _SendMessageBase(TeamTool, ABC):
         self.message_manager = message_manager
         self.t = t
         self._team = team
-        self.meeting_audio = True
         properties = {
             "to": to_schema,
             "content": {"type": "string", "description": t("send_message", "content")},
             "summary": {"type": "string", "description": t("send_message", "summary")},
+            "speech_text": {
+                "type": ["string", "null"], "minLength": 1,
+                "description": t("send_message", "speech_text") + (
+                    ". Omit or pass null to send directly; provide nonempty text to queue for meeting speech."
+                ),
+            },
         }
         if targets_schema is not None:
             properties["targets"] = targets_schema
@@ -82,24 +87,46 @@ class _SendMessageBase(TeamTool, ABC):
         }
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
-        to_raw = inputs.get("to")
-        targets_raw = inputs.get("targets")
-        content = inputs.get("content", "").strip()
-        summary = inputs.get("summary", "").strip()
-
-        if not content:
-            return ToolOutput(success=False, error="'content' is required")
-        oversize = self._reject_oversize_content(content)
-        if oversize:
-            return oversize
-
         try:
-            return await self._dispatch(to_raw, targets_raw, content, summary, inputs.get("speech_text"))
+            self._validate_message_inputs(inputs)
+            content = inputs.get("content", "").strip()
+            if not content:
+                return ToolOutput(success=False, error="'content' is required")
+            oversize = self._reject_oversize_content(content)
+            if oversize:
+                return oversize
+            self._validate_inputs(inputs)
+            return await self._dispatch(
+                inputs.get("to"), inputs.get("targets"), content,
+                inputs.get("summary", "").strip(), inputs.get("speech_text"),
+            )
         except ValueError as exc:
             return ToolOutput(success=False, error=str(exc))
-        except Exception as e:
-            team_logger.exception("send_message failed")
-            return ToolOutput(success=False, error=f"Internal error: {e}")
+        except Exception as exc:
+            team_logger.exception("{} failed", self.card.name)
+            return ToolOutput(success=False, error=f"Internal error: {exc}")
+
+    def _validate_message_inputs(self, inputs: dict[str, Any]) -> None:
+        if not isinstance(inputs, dict):
+            raise ValueError("Message arguments must be an object")
+        # Scheduled variants still reject targets in _dispatch, even though
+        # it is absent from their schema.
+        allowed = set(self.card.input_params["properties"]) | {"targets"}
+        if set(inputs) - allowed:
+            raise ValueError("Only declared message arguments are supported")
+        for field in ("content", "summary"):
+            if not isinstance(inputs.get(field, ""), str):
+                raise ValueError(f"'{field}' must be a string")
+
+    def _validate_inputs(self, inputs: dict[str, Any]) -> None:
+        """Validate queue arguments before starting or recovering members."""
+        speech_text = inputs.get("speech_text")
+        if speech_text is None:
+            return
+        if not isinstance(speech_text, str) or not speech_text.strip():
+            raise ValueError("'speech_text' must be nonempty or None")
+        if self._team is None:
+            raise ValueError("Meeting enqueue requires a Team backend")
 
     @abstractmethod
     async def _dispatch(
@@ -286,11 +313,16 @@ class _SendMessageBase(TeamTool, ABC):
     async def _queue_message(
         self, content: str, speech_text: str | None, route: MeetingRoute,
     ) -> ToolOutput | None:
-        if self._team is None or not self.meeting_audio or not self._team.meeting_enabled:
+        """Only omitted/null speech_text uses direct delivery; enqueue never falls back."""
+        if speech_text is None:
             return None
-        meeting = self._team.meeting
         if not isinstance(speech_text, str) or not speech_text.strip():
-            raise ValueError("'speech_text' is required while meeting is enabled")
+            raise ValueError("'speech_text' must be nonempty or None")
+        if self._team is None:
+            raise ValueError("Meeting enqueue requires a Team backend")
+        meeting = await self._team.get_meeting()
+        if meeting is None:
+            raise ValueError("Meeting must exist to enqueue a message")
         request = await meeting.enqueue_message(
             self.message_manager.member_name, content, speech_text=speech_text.strip(), route=route,
         )

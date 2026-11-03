@@ -103,6 +103,8 @@ class TeamJoinDescriptor(BaseModel):
     language: str = "cn"
     dispatch_mode: Literal["autonomous", "scheduled"] = "autonomous"
     teammate_mode: Literal["build_mode", "plan_mode"] = "build_mode"
+    conversation_mode: Literal["team", "group_chat"] = "team"
+    conversation_history_location: Literal["workspace", "session"] | None = None
     db_config: DatabaseConfig = Field(default_factory=DatabaseConfig)
     transport_config: MessagerTransportConfig = Field(default_factory=MessagerTransportConfig)
     workspace_config: TeamWorkspaceConfig | None = None

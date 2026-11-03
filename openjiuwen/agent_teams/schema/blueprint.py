@@ -798,6 +798,7 @@ class TeamAgentSpec(BaseModel):
             team_name=self.team_name,
             display_name=self.team_name,
             conversation_mode=conversation_mode,
+            conversation_history_location=self.conversation_history_location,
             leader_member_name=self.leader.member_name,
             language=resolved_language,
             dispatch_mode=self.dispatch_mode,

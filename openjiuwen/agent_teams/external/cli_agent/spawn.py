@@ -38,7 +38,6 @@ from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.harness_protocol import HarnessContext
-from openjiuwen.harness_providers.skills import normalize_skills
 from openjiuwen.harness_providers.claudecode import (
     DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     ClaudeCodeHarness,
@@ -47,7 +46,7 @@ from openjiuwen.harness_providers.claudecode import (
 )
 from openjiuwen.harness_providers.claudecode.options import strip_parent_claude_env
 from openjiuwen.harness_providers.codex import CodexHarness, CodexHarnessConfig, CodexModelConfig
-from openjiuwen.harness_providers.skills import SkillSource
+from openjiuwen.harness_providers.skills import SkillSource, normalize_skills
 
 MemberRuntimeLike = CliRuntimeBase | ExternalHarnessMemberRuntime
 
@@ -122,6 +121,8 @@ def descriptor_from_context(ctx: TeamRuntimeContext) -> TeamJoinDescriptor:
         # prompt describing tools it does not have.
         dispatch_mode=dispatch_mode,
         teammate_mode=teammate_mode,
+        conversation_mode=team_spec.conversation_mode,
+        conversation_history_location=team_spec.conversation_history_location,
         db_config=ctx.db_config,
         transport_config=transport,
         workspace_config=workspace_config,

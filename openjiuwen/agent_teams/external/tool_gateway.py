@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
-from openjiuwen.agent_teams.meeting.tools import configure_meeting_tool_schemas
 from openjiuwen.agent_teams.team_workspace.tools import WorkspaceMetaTool
 from openjiuwen.agent_teams.tools.locales import make_translator
 from openjiuwen.agent_teams.tools.team_tools import create_team_tools
@@ -43,9 +42,6 @@ class ExternalTeamToolGateway:
 
     async def definitions(self) -> tuple[ToolDefinition, ...]:
         """Return the definitions of the bound local team tools."""
-        configure_meeting_tool_schemas(
-            self._tools.values(), meeting_enabled=self._team_backend.meeting_enabled,
-        )
         return tuple(
             ToolDefinition(
                 name=tool.card.name,

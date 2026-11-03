@@ -26,7 +26,6 @@ from typing import (
     Set,
 )
 
-from openjiuwen.agent_teams.meeting.tools import configure_meeting_tool_schemas
 from openjiuwen.agent_teams.paths import async_tool_output_dir
 from openjiuwen.agent_teams.tools.team_tools import create_team_tools
 from openjiuwen.core.foundation.tool.base import Tool
@@ -176,19 +175,6 @@ class TeamToolRail(DeepAgentRail):
         self._wire_async_spill(agent)
 
         self._tools = tools
-
-    async def before_model_call(self, ctx: Any) -> None:
-        changed = configure_meeting_tool_schemas(
-            self._tools or (), meeting_enabled=self._team_backend.meeting_enabled,
-        )
-        if not changed:
-            return
-        cards = {tool.card.name: tool.card for tool in changed}
-        for tool in changed:
-            ctx.agent.ability_manager.add(tool.card)
-        for info in ctx.inputs.tools or ():
-            if info.name in cards:
-                info.parameters = cards[info.name].input_params
 
     def _wire_async_spill(self, agent: Any) -> None:
         """Wire the async-tool runtime's spill output-dir resolver (phase B).

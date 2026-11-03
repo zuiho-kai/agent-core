@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
 from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message, sync_history
@@ -107,20 +107,42 @@ class MeetingCoordinator:
         self, member_name: str, content: str, *, speech_text: str,
         route: MeetingRoute, mentions: tuple[str, ...] = (), request_id: str | None = None,
     ) -> SpeechRequest:
-        """Queue a message already validated by the existing Team send tool."""
+        """Queue a message prepared by a validated Team/group send tool.
+
+        Disabled or missing meetings reject retries too. This trusted primitive
+        does not replace the tool boundary's recipient and dispatch policies.
+        """
+        state = await self.get_state()
+        if state is None or not state.enabled:
+            raise ValueError("Meeting must be active to enqueue a message")
+        await self._require_member(member_name)
+
+        def matching(existing: SpeechRequest) -> SpeechRequest:
+            if (
+                existing.member_name, existing.content, existing.speech_text, existing.route, existing.mentions,
+            ) != (member_name, content, speech_text, route, mentions):
+                raise ValueError("client_message_id was already used for different meeting content")
+            return existing
+
         if request_id is not None:
             existing = await self.get_request(request_id)
             if existing is not None:
-                if (
-                    existing.member_name, existing.content, existing.speech_text, existing.route, existing.mentions,
-                ) != (member_name, content, speech_text, route, mentions):
-                    raise ValueError("client_message_id was already used for different meeting content")
-                return existing
+                return matching(existing)
         dao = await self._dao()
-        row = await dao.enqueue(
-            self.scope, request_id or uuid4().hex, member_name, content=content,
-            speech_text=speech_text, mentions=mentions, route=route,
-        )
+        try:
+            row = await dao.enqueue(
+                self.scope, request_id or uuid4().hex, member_name, content=content,
+                speech_text=speech_text, mentions=mentions, route=route,
+            )
+        except IntegrityError:
+            # Another process may win the same client_message_id after our read.
+            existing = await self.get_request(request_id) if request_id is not None else None
+            if existing is None:
+                raise
+            state = await self.get_state()
+            if state is None or not state.enabled:
+                raise ValueError("Meeting must be active to enqueue a message") from None
+            return matching(existing)
         return await self._request(row)
 
     async def _send_message(self, member_name: str, content: str, mentions: tuple[str, ...], request_id: str):

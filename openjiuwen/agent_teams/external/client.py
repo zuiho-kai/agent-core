@@ -232,12 +232,15 @@ class ExternalTeamClient:
             is_leader=self.is_leader,
             db=db,
             messager=self._messager,
+            dispatch_mode=self._descriptor.dispatch_mode,
         )
         from types import SimpleNamespace
 
         backend.group_chat_spec = SimpleNamespace(
             workspace=self._descriptor.workspace_config, language=self._descriptor.language,
+            conversation_history_location=self._descriptor.conversation_history_location,
         )
+        backend.conversation_mode = self._descriptor.conversation_mode
         backend.bind_group_session(self.session_id)
         self._backend = backend
         self._tasks = backend.task_manager

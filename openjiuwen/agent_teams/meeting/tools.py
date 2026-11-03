@@ -1,11 +1,10 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Meeting inspection and playback control; posting uses the Team send tools."""
+"""Meeting inspection and playback control, separate from message admission."""
 
-from collections.abc import Iterable
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -15,33 +14,6 @@ from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.core.foundation.tool.base import ToolCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
-
-if TYPE_CHECKING:
-    from openjiuwen.core.foundation.tool.base import Tool
-
-
-def configure_meeting_tool_schemas(tools: Iterable["Tool"], *, meeting_enabled: bool) -> list["Tool"]:
-    """Expose speech_text on the existing send tools only while meeting is enabled."""
-    changed = []
-    for tool in tools:
-        if tool.card.name not in ("send_message", "group_send_message") or not tool.meeting_audio:
-            continue
-        schema = tool.card.input_params
-        if ("speech_text" in schema["properties"]) == meeting_enabled:
-            continue
-        properties = dict(schema["properties"])
-        required = [name for name in schema["required"] if name != "speech_text"]
-        if meeting_enabled:
-            properties["speech_text"] = {
-                "type": "string", "minLength": 1,
-                "description": tool.t("send_message", "speech_text"),
-            }
-            required.append("speech_text")
-        else:
-            properties.pop("speech_text", None)
-        tool.card.input_params = {**schema, "properties": properties, "required": required}
-        changed.append(tool)
-    return changed
 
 
 class _MeetingTool(TeamTool):
