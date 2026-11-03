@@ -529,7 +529,10 @@ class TeamBackend:
             session_id, self.team_name, meeting_id=meeting_id,
         )
         meeting = await self._meeting_coordinator(self._meeting_scope(row.meeting_id))
-        await self._on_meeting_state_change()
+        try:
+            await self._on_meeting_state_change()
+        finally:
+            await meeting._notify_queue_changed()
         return meeting
 
     async def _on_meeting_state_change(self) -> None:
@@ -564,10 +567,9 @@ class TeamBackend:
     async def disable_meeting(self, *, meeting_id: str) -> bool:
         """Disable the observed meeting without discarding its identity.
 
-        Revokes audio and awaits FIFO text publication before completing. A
-        failed flush retains unsent requests; retry disable before re-enabling.
-        The host still owns stopping audio. Re-enabling resumes the same meeting
-        without replaying cancelled speech. close() permanently ends the instance.
+        Current playback may finish; the host consumer continues publishing
+        queued text without starting new audio. Re-enabling resumes the same
+        meeting. close() permanently ends the instance.
         """
         if not self.is_leader:
             raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason="Only the Team leader may disable meeting")

@@ -16,7 +16,7 @@ from dataclasses import asdict
 from typing import TypeVar
 from uuid import uuid4
 
-from sqlalchemy import case, inspect, or_, select, update
+from sqlalchemy import case, inspect, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,6 +89,26 @@ class MeetingDao:
                 await conn.run_sync(_ensure_meeting_lifecycle_schema, model.__table__)
                 await conn.run_sync(_ensure_speech_request_schema, _get_speech_request_model(session_id).__table__)
                 await conn.run_sync(_get_speech_publication_model(session_id).__table__.create, checkfirst=True)
+                # Recover a legacy disable interrupted during its text flush.
+                # Scope barrier cleanup to meetings with actual FLUSHING rows;
+                # new interruption barriers still require audio-stop acknowledgement.
+                requests = _get_speech_request_model(session_id)
+                flushing = list(await session.execute(
+                    select(requests.team_name, requests.meeting_id)
+                    .where(requests.status == SpeechRequestStatus.FLUSHING).distinct()
+                ))
+                for team_name, meeting_id in flushing:
+                    await session.execute(
+                        update(model).where(
+                            model.team_name == team_name, model.meeting_id == meeting_id,
+                            model.status == MeetingStatus.DISABLED, model.owner_request_id.is_(None),
+                        ).values(interruption_id=None)
+                    )
+                if flushing:
+                    await session.execute(
+                        update(requests).where(requests.status == SpeechRequestStatus.FLUSHING)
+                        .values(status=SpeechRequestStatus.QUEUED)
+                    )
             await session.commit()
         self._lifecycle_schemas_ready.add(model.__tablename__)
 
@@ -194,11 +214,6 @@ class MeetingDao:
                 if row.status == MeetingStatus.CLOSED:
                     raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Closed meeting IDs cannot be re-enabled")
                 if row.status == MeetingStatus.DISABLED:
-                    if row.interruption_id is not None:
-                        raise_error(
-                            StatusCode.AGENT_TEAM_STATE_INVALID,
-                            reason="Retry disabling the meeting to finish its pending text flush before enabling",
-                        )
                     row.status = MeetingStatus.ACTIVE
                     row.revision += 1
             await session.commit()
@@ -224,74 +239,16 @@ class MeetingDao:
                     return None
             raise
 
-    async def begin_disable(self, scope: MeetingScope) -> str | None:
-        """Revoke audio and retain pending text behind a resumable flush barrier."""
+    async def disable(self, scope: MeetingScope) -> bool:
+        """Turn off future audio without revoking a current lease or draining text."""
         try:
-            async with self._locked(scope) as (session, meeting):
+            async with self._locked(scope) as (_, meeting):
                 if meeting.status == MeetingStatus.CLOSED:
-                    return None
-                if meeting.status == MeetingStatus.DISABLED:
-                    return meeting.interruption_id
-                owner_id = meeting.owner_request_id
-                await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
-                model = _get_speech_request_model(scope.session_id)
-                await session.execute(
-                    update(model)
-                    .where(
-                        *_scope_filter(model, scope),
-                        or_(model.status == SpeechRequestStatus.QUEUED, model.request_id == owner_id),
-                    )
-                    .values(status=SpeechRequestStatus.FLUSHING)
-                )
+                    return False
                 meeting.status = MeetingStatus.DISABLED
-                meeting.interruption_id = uuid4().hex
-                return meeting.interruption_id
+                return True
         except _MeetingNotFoundError:
-            return None
-
-    async def next_flush_request(self, scope: MeetingScope, flush_token: str) -> TeamSpeechRequestBase | None:
-        """Read the oldest pending text; publication happens outside the transaction."""
-        model = _get_speech_request_model(scope.session_id)
-        async with self._locked(scope) as (session, meeting):
-            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
-                return None
-            return await session.scalar(
-                select(model)
-                .where(*_scope_filter(model, scope), model.status == SpeechRequestStatus.FLUSHING)
-                .order_by(model.sequence)
-                .limit(1)
-            )
-
-    async def complete_flush_request(
-        self, scope: MeetingScope, flush_token: str, request_id: str, message_id: str | tuple[str, ...],
-    ) -> bool:
-        """Record sent text and cancel its audio atomically for the current flush."""
-        model = _get_speech_request_model(scope.session_id)
-        async with self._locked(scope) as (session, meeting):
-            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
-                return False
-            row = await session.get(model, {**_scope_values(scope), "request_id": request_id})
-            if row is None or row.status != SpeechRequestStatus.FLUSHING:
-                return False
-            await self._record_publications(session, scope, row, message_id)
-            row.status = SpeechRequestStatus.INTERRUPTED if row.lease_token else SpeechRequestStatus.CANCELLED
-            return True
-
-    async def finish_disable(self, scope: MeetingScope, flush_token: str) -> bool:
-        """Finish only after all text is recorded; failed flushes remain retryable."""
-        model = _get_speech_request_model(scope.session_id)
-        async with self._locked(scope) as (session, meeting):
-            if meeting.status != MeetingStatus.DISABLED or meeting.interruption_id != flush_token:
-                return False
-            pending = await session.scalar(
-                select(model.request_id)
-                .where(*_scope_filter(model, scope), model.status == SpeechRequestStatus.FLUSHING)
-                .limit(1)
-            )
-            if pending is not None:
-                return False
-            meeting.interruption_id = None
-            return True
+            return False
 
     async def enqueue(
         self,
@@ -321,8 +278,8 @@ class MeetingDao:
             raise ValueError("Queued content must be non-empty")
         request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
-            if meeting.status != MeetingStatus.ACTIVE:
-                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting must be active to queue speech")
+            if meeting.status == MeetingStatus.CLOSED:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting must be open to queue speech")
             key = {**_scope_values(scope), "request_id": request_id}
             role = await session.scalar(
                 select(TeamMember.role).where(
@@ -382,19 +339,42 @@ class MeetingDao:
             request_model, {**_scope_values(scope), "request_id": request_id}, session_id=scope.session_id,
         )
 
-    async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
-        """Grant one lease; message sending runs afterward in the wrapper."""
+    async def grant_next(
+        self, scope: MeetingScope, *, playback_ready: bool = True,
+    ) -> TeamSpeechRequestBase | None:
+        """Claim one publication; serialize it with the current audio/publication owner."""
         async with self._locked(scope) as (session, meeting):
-            if meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id or meeting.owner_request_id:
+            if meeting.status == MeetingStatus.CLOSED or meeting.interruption_id or meeting.owner_request_id:
                 return None
             request = await session.scalar(self._pending_query(scope, meeting).limit(1))
             if request is None:
                 return None
-            request.status = SpeechRequestStatus.GRANTED
+            request.status = (
+                SpeechRequestStatus.GRANTED if playback_ready and meeting.status == MeetingStatus.ACTIVE
+                else SpeechRequestStatus.PUBLISHING
+            )
             request.lease_token = uuid4().hex
             request.granted_at = get_current_time()
             meeting.owner_request_id = request.request_id
             meeting.lease_token = request.lease_token
+            return request
+
+    async def finish_publication(
+        self, scope: MeetingScope, lease_token: str, *, playback_ready: bool = True,
+    ) -> TeamSpeechRequestBase | None:
+        """Keep an audio lease or atomically finish text-only delivery after publication."""
+        async with self._locked(scope) as (session, meeting):
+            if meeting.closed or meeting.lease_token != lease_token or meeting.owner_request_id is None:
+                return None
+            model = _get_speech_request_model(scope.session_id)
+            request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
+            if request.source_message_id is None:
+                raise ValueError("Cannot finish publication before text is recorded")
+            if (request.status == SpeechRequestStatus.PUBLISHING
+                    or meeting.status == MeetingStatus.DISABLED or not playback_ready):
+                await self._release(session, scope, meeting, SpeechRequestStatus.TEXT_ONLY)
+                request.status = SpeechRequestStatus.TEXT_ONLY
+                request.lease_token = None
             return request
 
     async def get_publication_ids(self, scope: MeetingScope, request_id: str) -> tuple[str, ...]:
@@ -483,7 +463,12 @@ class MeetingDao:
         """Release only the current lease after trusted publication/playback completion."""
         try:
             async with self._locked(scope) as (session, meeting):
-                if not lease_token or meeting.status != MeetingStatus.ACTIVE or meeting.lease_token != lease_token:
+                if not lease_token or meeting.closed or meeting.lease_token != lease_token:
+                    return False
+                model = _get_speech_request_model(scope.session_id)
+                request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
+                if (request is None or request.status != SpeechRequestStatus.GRANTED
+                        or request.source_message_id is None):
                     return False
                 await self._release(session, scope, meeting, SpeechRequestStatus.COMPLETED)
                 return True
@@ -500,7 +485,7 @@ class MeetingDao:
         """
         try:
             async with self._locked(scope) as (session, meeting):
-                if meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id:
+                if meeting.closed or meeting.interruption_id:
                     return None
                 if expected_token is not None and (not expected_token or meeting.lease_token != expected_token):
                     return None
@@ -517,7 +502,7 @@ class MeetingDao:
             async with self._locked(scope) as (_, meeting):
                 if (
                     not interruption_id
-                    or meeting.status != MeetingStatus.ACTIVE
+                    or meeting.closed
                     or meeting.interruption_id != interruption_id
                 ):
                     return False

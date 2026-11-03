@@ -33,6 +33,7 @@ class TeamTopic(str, Enum):
     TEAM = "team"
     TASK = "task"
     MESSAGE = "message"
+    MEETING_QUEUE = "meeting_queue"
 
     def build(self, session_id: str, team_name: str) -> str:
         """Build the final topic string.
@@ -110,6 +111,7 @@ class TeamEvent:
     STANDBY = "team_standby"
     TEAM_COMPLETED = "team_completed"
     MEETING_STATE_CHANGED = "meeting_state_changed"
+    MEETING_QUEUE_CHANGED = "meeting_queue_changed"
 
     # Member lifecycle events
     MEMBER_SPAWNED = "member_spawned"
@@ -197,6 +199,12 @@ class TeamCleanedEvent(BaseEventMessage):
 
 class MeetingStateChangedEvent(BaseEventMessage):
     """The persisted Team/session meeting state changed; runtime owners reload it."""
+
+
+class MeetingQueueChangedEvent(BaseEventMessage):
+    """Wake the host consumer; persisted queue state remains authoritative."""
+
+    meeting_id: str
 
 
 class TeamStandbyEvent(BaseEventMessage):
@@ -717,6 +725,7 @@ _EVENT_TYPE_MAP: Dict[str, Type[BaseEventMessage]] = {  # event_type -> model cl
     TeamEvent.STANDBY: TeamStandbyEvent,
     TeamEvent.TEAM_COMPLETED: TeamCompletedEvent,
     TeamEvent.MEETING_STATE_CHANGED: MeetingStateChangedEvent,
+    TeamEvent.MEETING_QUEUE_CHANGED: MeetingQueueChangedEvent,
     TeamEvent.MEMBER_SPAWNED: MemberSpawnedEvent,
     TeamEvent.MEMBER_RESTARTED: MemberRestartedEvent,
     TeamEvent.MEMBER_STATUS_CHANGED: MemberStatusChangedEvent,

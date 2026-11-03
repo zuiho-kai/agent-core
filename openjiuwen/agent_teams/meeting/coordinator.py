@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
 from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message, sync_history
+from openjiuwen.agent_teams.schema.events import EventMessage, MeetingQueueChangedEvent, TeamTopic
 from openjiuwen.agent_teams.schema.meeting import (
     MeetingRoute,
     MeetingScope,
@@ -69,6 +70,27 @@ class MeetingCoordinator:
         self._conversation = conversation
         self._on_state_change = on_state_change
 
+    @property
+    def queue_topic(self) -> str:
+        """Transport topic for host consumers; subscribe before the initial drain."""
+        return TeamTopic.MEETING_QUEUE.build(self.scope.session_id, self.scope.team_name)
+
+    async def _notify_queue_changed(self) -> None:
+        messager = self._message_manager.messager if self._message_manager is not None else None
+        if messager is None:
+            return
+        try:
+            await messager.publish(
+                topic_id=self.queue_topic,
+                message=EventMessage.from_event(MeetingQueueChangedEvent(
+                    team_name=self.scope.team_name, meeting_id=self.scope.meeting_id,
+                )),
+            )
+        except Exception as exc:
+            # Admission/release already committed. Do not turn a lost wake into
+            # a failed send receipt that makes the caller enqueue another copy.
+            team_logger.warning("Meeting queue wake failed for %s: %s", self.scope.meeting_id, exc)
+
     def for_member(self, member_name: str) -> "MeetingMemberClient":
         """Bind trusted host identity to member inspection and interruption."""
         from openjiuwen.agent_teams.meeting.member import MeetingMemberClient
@@ -109,12 +131,13 @@ class MeetingCoordinator:
     ) -> SpeechRequest:
         """Queue a message prepared by a validated Team/group send tool.
 
-        Disabled or missing meetings reject retries too. This trusted primitive
-        does not replace the tool boundary's recipient and dispatch policies.
+        Missing or closed meetings reject retries; disabled meetings admit work.
+        This trusted primitive does not replace the tool boundary's recipient
+        and dispatch policies. Audio eligibility is decided when dequeuing.
         """
         state = await self.get_state()
-        if state is None or not state.enabled:
-            raise ValueError("Meeting must be active to enqueue a message")
+        if state is None or state.closed:
+            raise ValueError("Meeting must exist and be open to enqueue a message")
         await self._require_member(member_name)
 
         def matching(existing: SpeechRequest) -> SpeechRequest:
@@ -127,7 +150,9 @@ class MeetingCoordinator:
         if request_id is not None:
             existing = await self.get_request(request_id)
             if existing is not None:
-                return matching(existing)
+                result = matching(existing)
+                await self._notify_queue_changed()
+                return result
         dao = await self._dao()
         try:
             row = await dao.enqueue(
@@ -140,9 +165,12 @@ class MeetingCoordinator:
             if existing is None:
                 raise
             state = await self.get_state()
-            if state is None or not state.enabled:
-                raise ValueError("Meeting must be active to enqueue a message") from None
-            return matching(existing)
+            if state is None or state.closed:
+                raise ValueError("Meeting must exist and be open to enqueue a message") from None
+            result = matching(existing)
+            await self._notify_queue_changed()
+            return result
+        await self._notify_queue_changed()
         return await self._request(row)
 
     async def _send_message(self, member_name: str, content: str, mentions: tuple[str, ...], request_id: str):
@@ -225,8 +253,11 @@ class MeetingCoordinator:
             await self._database.create_cur_session_tables()
         finally:
             reset_session_id(token)
-        if self._on_state_change is not None:
-            await self._on_state_change()
+        try:
+            if self._on_state_change is not None:
+                await self._on_state_change()
+        finally:
+            await self._notify_queue_changed()
         return state
 
     async def get_state(self) -> MeetingState | None:
@@ -258,16 +289,12 @@ class MeetingCoordinator:
             raise ValueError("Source message does not exist in this session")
         if (source.team_name, source.from_member_name) != (self.scope.team_name, member_name):
             raise ValueError("Source message must belong to this team and the requesting member")
-        return await self._request(
-            await dao.enqueue(
-                self.scope,
-                request_id,
-                member_name,
-                source_message_id=source_message_id,
-                speech_text=speech_text,
-                route=self._route_from_row(source),
-            )
+        row = await dao.enqueue(
+            self.scope, request_id, member_name, source_message_id=source_message_id,
+            speech_text=speech_text, route=self._route_from_row(source),
         )
+        await self._notify_queue_changed()
+        return await self._request(row)
 
     async def get_source_message(self, source_message_id: str) -> SpeechSource | None:
         """Read full text by ID, even after A2A consumption; never advance read state."""
@@ -306,15 +333,23 @@ class MeetingCoordinator:
     async def set_addressed_members(self, member_names: Iterable[str]) -> bool:
         """Replace the trusted human-routing result; never preempt a current lease."""
         dao = await self._dao()
-        return await dao.set_addressed_members(self.scope, member_names)
+        changed = await dao.set_addressed_members(self.scope, member_names)
+        if changed:
+            await self._notify_queue_changed()
+        return changed
 
-    async def grant_next(self) -> SpeechRequest | None:
-        """Claim queued work, send full text normally, then return both versions for audio."""
+    async def grant_next(self, *, playback_ready: bool = True) -> SpeechRequest | None:
+        """Publish one queued message, returning GRANTED audio or terminal TEXT_ONLY.
+
+        The host owns one serialized consumer and supplies current transport readiness.
+        A publication error retains its claim token for retry_publication. None means
+        empty, closed, or blocked by another claim/interruption; it is not completion.
+        """
         dao = await self._dao()
-        row = await dao.grant_next(self.scope)
+        row = await dao.grant_next(self.scope, playback_ready=playback_ready)
         if row is None:
             return None
-        return await self._publish_granted(await self._request(row))
+        return await self._publish_granted(await self._request(row), playback_ready=playback_ready)
 
     async def _publish_route(
         self, member_name: str, content: str, route: MeetingRoute, mentions: tuple[str, ...],
@@ -395,10 +430,12 @@ class MeetingCoordinator:
             request.member_name, request.content, request.route, request.mentions, request.request_id, recover=recover,
         )
 
-    async def _publish_granted(self, request: SpeechRequest, *, recover: bool = False) -> SpeechRequest | None:
+    async def _publish_granted(
+        self, request: SpeechRequest, *, recover: bool = False, playback_ready: bool = True,
+    ) -> SpeechRequest | None:
         """Send only claimed queue content; ordinary reads never publish anything."""
         state = await self.get_state()
-        if state is None or not state.enabled or state.lease_token != request.lease_token:
+        if state is None or state.closed or state.lease_token != request.lease_token:
             return None
         if request.source_message_id is None:
             try:
@@ -415,40 +452,61 @@ class MeetingCoordinator:
             except Exception as exc:
                 team_logger.warning("Granted meeting publication failed for %s: %s", request.request_id, exc)
                 request = replace(request, delivery_error="message_publication_failed")
-        # Sending may overlap interruption/close. Already sent text remains;
-        # a revoked turn must never be returned as ready for playback.
-        state = await self.get_state()
-        if state is None or not state.enabled or state.lease_token != request.lease_token:
+        # Publishing errors retain ownership so the host retries this same request.
+        if request.delivery_error:
+            state = await self.get_state()
+            if state is None or state.closed or state.lease_token != request.lease_token:
+                return None
+            return request
+        dao = await self._dao()
+        try:
+            row = await dao.finish_publication(self.scope, request.lease_token, playback_ready=playback_ready)
+        except Exception as exc:
+            team_logger.warning("Meeting publication completion failed for %s: %s", request.request_id, exc)
+            return replace(request, delivery_error="message_publication_failed")
+        if row is None:
             return None
-        return request
+        result = await self._request(row)
+        if result.status == SpeechRequestStatus.TEXT_ONLY:
+            await self._notify_queue_changed()
+        return result
 
-    async def retry_publication(self, lease_token: str) -> SpeechRequest | None:
-        """Retry delivery preparation for this current lease, retaining the same token."""
+    async def retry_publication(
+        self, lease_token: str, *, playback_ready: bool = True,
+    ) -> SpeechRequest | None:
+        """Retry the current publication claim; never create another queue entry."""
         request = await self.get_speaker()
         if request is None or request.lease_token != lease_token:
             return None
-        return await self._publish_granted(request, recover=True)
+        return await self._publish_granted(request, recover=True, playback_ready=playback_ready)
 
     async def get_speaker(self) -> SpeechRequest | None:
-        """Observe the current lease; a concurrent release can make it stale immediately."""
+        """Observe the current audio/publication claim, including while disabled."""
         dao = await self._dao()
         meeting = await dao.get_meeting(self.scope)
-        if meeting is None or meeting.status != MeetingStatus.ACTIVE or meeting.owner_request_id is None:
+        if meeting is None or meeting.closed or meeting.owner_request_id is None:
             return None
         row = await dao.get_request(self.scope, meeting.owner_request_id)
-        if row is None or row.status != SpeechRequestStatus.GRANTED or row.lease_token != meeting.lease_token:
+        if (row is None or row.status not in (SpeechRequestStatus.GRANTED, SpeechRequestStatus.PUBLISHING)
+                or row.lease_token != meeting.lease_token):
             return None
         return await self._request(row)
 
     async def cancel_request(self, request_id: str) -> bool:
         """Cancel queued text before sending; leave already sent messages intact."""
         dao = await self._dao()
-        return await dao.cancel_request(self.scope, request_id)
+        cancelled = await dao.cancel_request(self.scope, request_id)
+        if cancelled:
+            await self._notify_queue_changed()
+        return cancelled
 
     async def complete_playback(self, lease_token: str) -> bool:
         """Acknowledge finished playback for the matching lease; never auto-grant."""
         dao = await self._dao()
-        return await dao.complete_playback(self.scope, lease_token)
+        completed = await dao.complete_playback(self.scope, lease_token)
+        if completed:
+            await self._notify_queue_changed()
+        return completed
 
     async def interrupt_speech(self, *, expected_token: str | None = None) -> SpeechInterruption | None:
         """Trusted host interruption; caller must stop audio before acknowledging."""
@@ -470,42 +528,31 @@ class MeetingCoordinator:
     async def resume_after_interruption(self, interruption_id: str) -> bool:
         """Host confirms audio stopped and, for human interruption, input admitted."""
         dao = await self._dao()
-        return await dao.resume_after_interruption(self.scope, interruption_id)
+        resumed = await dao.resume_after_interruption(self.scope, interruption_id)
+        if resumed:
+            await self._notify_queue_changed()
+        return resumed
 
     async def disable(self) -> bool:
-        """Disable audio and await FIFO publication of all remaining text.
-
-        A failed/cancelled drain retains its unsent requests and barrier. Retry
-        this operation to continue; enable is blocked until the drain finishes.
-        The host remains responsible for stopping already playing audio.
-        """
+        """Disable future audio; the consumer drains text and current playback may finish."""
         dao = await self._dao()
-        flush_token = await dao.begin_disable(self.scope)
-        if flush_token is None:
-            return False
-        if self._on_state_change is not None:
-            await self._on_state_change()
-        while (row := await dao.next_flush_request(self.scope, flush_token)) is not None:
+        disabled = await dao.disable(self.scope)
+        if disabled:
             try:
-                request = await self._request(row)
-                source_id = await self._send_queued_text(request, recover=True)
-                if not await dao.complete_flush_request(self.scope, flush_token, request.request_id, source_id):
-                    # Close/another flush may win after sending. Already committed
-                    # text still needs its queue reference, without reviving audio.
-                    await dao.record_publication(self.scope, request.request_id, source_id)
-                    return False
-            except Exception as exc:
-                raise_error(
-                    StatusCode.AGENT_TEAM_STATE_INVALID,
-                    reason=f"Text flush failed for request {row.request_id}; retry disabling the meeting to continue",
-                    cause=exc,
-                )
-        return await dao.finish_disable(self.scope, flush_token)
+                if self._on_state_change is not None:
+                    await self._on_state_change()
+            finally:
+                await self._notify_queue_changed()
+        return disabled
 
     async def close(self) -> bool:
         """Permanently close audio coordination; caller stops audio and owns the DB."""
         dao = await self._dao()
         closed = await dao.close_meeting(self.scope)
-        if closed and self._on_state_change is not None:
-            await self._on_state_change()
+        if closed:
+            try:
+                if self._on_state_change is not None:
+                    await self._on_state_change()
+            finally:
+                await self._notify_queue_changed()
         return closed

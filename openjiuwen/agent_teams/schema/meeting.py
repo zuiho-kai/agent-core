@@ -10,7 +10,7 @@ from typing import Literal
 
 @dataclass(frozen=True, slots=True)
 class MeetingRoute:
-    """Original Team publication destination, retained until grant or text flush."""
+    """Original Team publication destination, retained until dequeue."""
 
     kind: Literal["direct", "multicast", "broadcast", "group_chat"] = "group_chat"
     recipients: tuple[str, ...] = ()
@@ -46,6 +46,8 @@ class SpeechRequestStatus(StrEnum):
 
     QUEUED = "queued"
     GRANTED = "granted"
+    PUBLISHING = "publishing"
+    TEXT_ONLY = "text_only"
     FLUSHING = "flushing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
@@ -90,7 +92,8 @@ class MeetingState:
 
     @property
     def flushing(self) -> bool:
-        return self.status == MeetingStatus.DISABLED and self.interruption_id is not None
+        """Compatibility observation for legacy disable-time flushes."""
+        return False
 
 
 @dataclass(frozen=True, slots=True)
