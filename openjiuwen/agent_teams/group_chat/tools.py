@@ -3,8 +3,6 @@
 """Public conversation tools with backend-bound author and team/session."""
 from typing import Any
 
-from openjiuwen.agent_teams.group_chat.handler import prepare_message
-from openjiuwen.agent_teams.schema.meeting import MeetingRoute
 from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.common.logging import team_logger
 from openjiuwen.core.foundation.tool.base import ToolCard
@@ -20,12 +18,6 @@ class GroupSendMessageTool(TeamTool):
         self.card.input_params = {"type": "object", "properties": {
             "content": {"type": "string"}, "client_message_id": {"type": "string"},
             "mentions": {"type": "array", "items": {"type": "string"}},
-            "speech_text": {
-                "type": ["string", "null"], "minLength": 1,
-                "description": t("send_message", "speech_text") + (
-                    ". Omit or pass null to send directly; provide nonempty text to queue for meeting speech."
-                ),
-            },
         }, "required": ["content", "client_message_id"], "additionalProperties": False}
 
     async def invoke(self, inputs: dict[str, Any], **kwargs) -> ToolOutput:
@@ -36,28 +28,11 @@ class GroupSendMessageTool(TeamTool):
                 raise ValueError("Only declared group-message arguments are supported")
             if set(self.card.input_params["required"]) - set(inputs):
                 raise ValueError("Required group-message arguments are missing")
-            speech_text = inputs.get("speech_text")
-            if speech_text is None:
-                result = await self.backend.append_group_message(
-                    self.backend.member_name, inputs["content"], client_message_id=inputs["client_message_id"],
-                    mentions=inputs.get("mentions", ()),
-                )
-                return ToolOutput(success=True, data=result.model_dump(mode="json"))
-            if not isinstance(speech_text, str) or not speech_text.strip():
-                raise ValueError("'speech_text' must be nonempty or None")
-            meeting = await self.backend.get_meeting()
-            if meeting is None:
-                raise ValueError("Meeting must exist to enqueue a group message")
-            meta, _ = await prepare_message(
-                await self.backend.group_conversation(), self.backend.message_manager,
+            result = await self.backend.append_group_message(
                 self.backend.member_name, inputs["content"], client_message_id=inputs["client_message_id"],
                 mentions=inputs.get("mentions", ()),
             )
-            request = await meeting.enqueue_message(
-                self.backend.member_name, inputs["content"], speech_text=speech_text.strip(),
-                route=MeetingRoute(), mentions=tuple(meta["mentions"]), request_id=inputs["client_message_id"],
-            )
-            return ToolOutput(success=True, data={"queued": True, "request_id": request.request_id})
+            return ToolOutput(success=True, data=result.model_dump(mode="json"))
         except Exception as exc:
             team_logger.error("Could not post group message: {}", exc)
             return ToolOutput(success=False, error=str(exc))

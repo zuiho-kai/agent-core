@@ -8,7 +8,6 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from openjiuwen.agent_teams.constants import USER_PSEUDO_MEMBER_NAME
-from openjiuwen.agent_teams.schema.meeting import MeetingRoute
 from openjiuwen.agent_teams.tools.locales import Translator
 from openjiuwen.agent_teams.tools.message_manager import TeamMessageManager
 from openjiuwen.agent_teams.tools.team import TeamBackend
@@ -71,12 +70,6 @@ class _SendMessageBase(TeamTool, ABC):
             "to": to_schema,
             "content": {"type": "string", "description": t("send_message", "content")},
             "summary": {"type": "string", "description": t("send_message", "summary")},
-            "speech_text": {
-                "type": ["string", "null"], "minLength": 1,
-                "description": t("send_message", "speech_text") + (
-                    ". Omit or pass null to send directly; provide nonempty text to queue for meeting speech."
-                ),
-            },
         }
         if targets_schema is not None:
             properties["targets"] = targets_schema
@@ -95,10 +88,9 @@ class _SendMessageBase(TeamTool, ABC):
             oversize = self._reject_oversize_content(content)
             if oversize:
                 return oversize
-            self._validate_inputs(inputs)
             return await self._dispatch(
                 inputs.get("to"), inputs.get("targets"), content,
-                inputs.get("summary", "").strip(), inputs.get("speech_text"),
+                inputs.get("summary", "").strip(),
             )
         except ValueError as exc:
             return ToolOutput(success=False, error=str(exc))
@@ -118,16 +110,6 @@ class _SendMessageBase(TeamTool, ABC):
             if not isinstance(inputs.get(field, ""), str):
                 raise ValueError(f"'{field}' must be a string")
 
-    def _validate_inputs(self, inputs: dict[str, Any]) -> None:
-        """Validate queue arguments before starting or recovering members."""
-        speech_text = inputs.get("speech_text")
-        if speech_text is None:
-            return
-        if not isinstance(speech_text, str) or not speech_text.strip():
-            raise ValueError("'speech_text' must be nonempty or None")
-        if self._team is None:
-            raise ValueError("Meeting enqueue requires a Team backend")
-
     @abstractmethod
     async def _dispatch(
         self,
@@ -135,7 +117,6 @@ class _SendMessageBase(TeamTool, ABC):
         targets_raw: Any,
         content: str,
         summary: str,
-        speech_text: str | None = None,
     ) -> ToolOutput:
         """Route the request to a delivery primitive based on recipient fields."""
         ...
@@ -169,11 +150,8 @@ class _SendMessageBase(TeamTool, ABC):
             ),
         )
 
-    async def _broadcast(self, content: str, summary: str, speech_text: str | None = None) -> ToolOutput:
+    async def _broadcast(self, content: str, summary: str) -> ToolOutput:
         await self._auto_start_members()
-        queued = await self._queue_message(content, speech_text, MeetingRoute(kind="broadcast"))
-        if queued is not None:
-            return queued
         msg_id = await self.message_manager.broadcast_message(content=content)
         if not msg_id:
             return ToolOutput(success=False, error="Failed to broadcast message")
@@ -187,7 +165,7 @@ class _SendMessageBase(TeamTool, ABC):
         )
 
     async def _send(
-        self, to: str, content: str, summary: str, speech_text: str | None = None,
+        self, to: str, content: str, summary: str,
     ) -> ToolOutput:
         if to == USER_PSEUDO_MEMBER_NAME and self._team and self._team.is_leader:
             return ToolOutput(success=False, error=self.t("send_message", "error_leader_to_user"))
@@ -199,9 +177,6 @@ class _SendMessageBase(TeamTool, ABC):
         await self._auto_start_members()
         if to != USER_PSEUDO_MEMBER_NAME:
             await self._recover_members([to])
-        queued = await self._queue_message(content, speech_text, MeetingRoute(kind="direct", recipients=(to,)))
-        if queued is not None:
-            return queued
         msg_id = await self.message_manager.send_message(content=content, to_member_name=to)
         if not msg_id:
             return ToolOutput(success=False, error=f"Failed to send message to '{to}'")
@@ -220,7 +195,6 @@ class _SendMessageBase(TeamTool, ABC):
         targets: list[str],
         content: str,
         summary: str,
-        speech_text: str | None = None,
     ) -> ToolOutput:
         """Send identical content to multiple members as independent point-to-point messages.
 
@@ -282,12 +256,6 @@ class _SendMessageBase(TeamTool, ABC):
 
         delivered: list[str] = []
         if valid:
-            queued = await self._queue_message(content, speech_text, MeetingRoute(kind="multicast", recipients=valid))
-            if queued is not None:
-                queued.success = not failed
-                queued.error = "Some recipients were not found" if failed else None
-                queued.data.update(failed=failed)
-                return queued
             ids = await self.message_manager.multicast_message(content=content, to_member_names=valid)
             if ids:
                 delivered = valid
@@ -309,27 +277,6 @@ class _SendMessageBase(TeamTool, ABC):
                 "summary": summary or None,
             },
         )
-
-    async def _queue_message(
-        self, content: str, speech_text: str | None, route: MeetingRoute,
-    ) -> ToolOutput | None:
-        """Only omitted/null speech_text uses direct delivery; enqueue never falls back."""
-        if speech_text is None:
-            return None
-        if not isinstance(speech_text, str) or not speech_text.strip():
-            raise ValueError("'speech_text' must be nonempty or None")
-        if self._team is None:
-            raise ValueError("Meeting enqueue requires a Team backend")
-        meeting = await self._team.get_meeting()
-        if meeting is None:
-            raise ValueError("Meeting must exist to enqueue a message")
-        request = await meeting.enqueue_message(
-            self.message_manager.member_name, content, speech_text=speech_text.strip(), route=route,
-        )
-        return ToolOutput(success=True, data={
-            "type": "queued", "request_id": request.request_id,
-            "from": self.message_manager.member_name, "to": list(route.recipients),
-        })
 
     async def _auto_start_members(self) -> None:
         """Auto-start unstarted members before a message is written.
@@ -357,11 +304,6 @@ class _SendMessageBase(TeamTool, ABC):
 
     def render_for_llm(self, output: ToolOutput) -> str:
         d = output.data
-        if isinstance(d, dict) and d.get("type") == "queued":
-            queued = f"Message queued for meeting speech: {d['request_id']}"
-            if not output.success:
-                return self._format_multicast_text(output.error, {**d, "delivered": []}) + "; " + queued
-            return queued
         if not output.success:
             base = output.error or "Failed to send message"
             if isinstance(d, dict) and d.get("type") == "multicast":
@@ -428,7 +370,6 @@ class SendMessageTool(_SendMessageBase):
         targets_raw: Any,
         content: str,
         summary: str,
-        speech_text: str | None = None,
     ) -> ToolOutput:
         """Route exactly one separated recipient field."""
         if to_raw is not None and targets_raw is not None:
@@ -436,7 +377,7 @@ class SendMessageTool(_SendMessageBase):
         if targets_raw is not None:
             if not isinstance(targets_raw, list):
                 return ToolOutput(success=False, error="'targets' must be an array of strings")
-            return await self._multicast(targets_raw, content, summary, speech_text)
+            return await self._multicast(targets_raw, content, summary)
         if isinstance(to_raw, list):
             return ToolOutput(success=False, error="'to' must be a string; use 'targets' for multicast")
         if isinstance(to_raw, str):
@@ -454,8 +395,8 @@ class SendMessageTool(_SendMessageBase):
                         error="'to' accepts one member; pass the member array directly in 'targets'",
                     )
             if to == "*":
-                return await self._broadcast(content, summary, speech_text)
-            return await self._send(to, content, summary, speech_text)
+                return await self._broadcast(content, summary)
+            return await self._send(to, content, summary)
         if to_raw is None:
             return ToolOutput(success=False, error="One of 'to' or 'targets' is required")
         return ToolOutput(success=False, error="'to' must be a string")
@@ -501,7 +442,6 @@ class ReportToLeaderTool(_SendMessageBase):
         targets_raw: Any,
         content: str,
         summary: str,
-        speech_text: str | None = None,
     ) -> ToolOutput:
         """Resolve the role word and deliver; reject anything else.
 
@@ -515,7 +455,7 @@ class ReportToLeaderTool(_SendMessageBase):
             return ToolOutput(success=False, error="'to' must be a string")
         to = to_raw.strip()
         if to == USER_PSEUDO_MEMBER_NAME:
-            return await self._send(USER_PSEUDO_MEMBER_NAME, content, summary, speech_text)
+            return await self._send(USER_PSEUDO_MEMBER_NAME, content, summary)
         if to == LEADER_ROLE_RECIPIENT:
             leader = (await self._team.resolve_leader_member_name()).strip() if self._team else ""
             if not leader:
@@ -523,7 +463,7 @@ class ReportToLeaderTool(_SendMessageBase):
                     success=False,
                     error="cannot resolve the team leader to deliver to; the team has no leader on record",
                 )
-            return await self._send(leader, content, summary, speech_text)
+            return await self._send(leader, content, summary)
         return ToolOutput(
             success=False,
             error=(

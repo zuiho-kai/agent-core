@@ -5,14 +5,13 @@
 
 import json
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import replace
 from typing import TYPE_CHECKING
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
-from openjiuwen.agent_teams.group_chat.handler import group_metadata, post_message, sync_history
+from openjiuwen.agent_teams.group_chat.handler import group_metadata
 from openjiuwen.agent_teams.schema.events import EventMessage, MeetingQueueChangedEvent, TeamTopic
 from openjiuwen.agent_teams.schema.meeting import (
     MeetingRoute,
@@ -28,8 +27,6 @@ from openjiuwen.agent_teams.schema.status import MEMBER_DEPARTED_STATUSES
 from openjiuwen.agent_teams.tools.database import TeamDatabase
 from openjiuwen.agent_teams.tools.database.meeting_dao import MeetingDao
 from openjiuwen.agent_teams.tools.models import TeamMeetingBase, TeamSpeechRequestBase
-from openjiuwen.core.common.exception.codes import StatusCode
-from openjiuwen.core.common.exception.errors import raise_error
 from openjiuwen.core.common.logging import team_logger
 
 if TYPE_CHECKING:
@@ -39,7 +36,7 @@ if TYPE_CHECKING:
 
 
 class MeetingCoordinator:
-    """Attach speaking ownership and grant-gated publication to an existing Team database.
+    """Expose queue ownership and explicit message references over an existing Team database.
 
     Host code must derive member names from trusted runtime identity. Do not expose
     this object or its host-only methods directly as agent/browser tools. The caller
@@ -129,12 +126,33 @@ class MeetingCoordinator:
         self, member_name: str, content: str, *, speech_text: str,
         route: MeetingRoute, mentions: tuple[str, ...] = (), request_id: str | None = None,
     ) -> SpeechRequest:
-        """Queue a message prepared by a validated Team/group send tool.
+        """Queue content explicitly selected by the host for meeting publication.
 
         Missing or closed meetings reject retries; disabled meetings admit work.
         This trusted primitive does not replace the tool boundary's recipient
         and dispatch policies. Audio eligibility is decided when dequeuing.
         """
+        for label, value in (("Member name", member_name), ("Content", content), ("Speech text", speech_text)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} must be a nonempty string")
+        if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
+            raise ValueError("Request ID must be a nonempty string")
+        if not isinstance(route, MeetingRoute) or route.kind not in {"direct", "multicast", "broadcast", "group_chat"}:
+            raise ValueError("A supported meeting route is required")
+        if not isinstance(route.protocol, str) or not route.protocol.strip():
+            raise ValueError("Route protocol must be a nonempty string")
+        if any(not isinstance(name, str) or not name.strip() for name in route.recipients):
+            raise ValueError("Route recipients must be nonempty member names")
+        if len(set(route.recipients)) != len(route.recipients):
+            raise ValueError("Route recipients must be distinct")
+        if ((route.kind == "direct" and len(route.recipients) != 1)
+                or (route.kind == "multicast" and not route.recipients)
+                or (route.kind in {"broadcast", "group_chat"} and route.recipients)):
+            raise ValueError("Route recipients do not match the route kind")
+        if not isinstance(mentions, tuple) or any(not isinstance(name, str) or not name.strip() for name in mentions):
+            raise ValueError("Mentions must be a tuple of nonempty member names")
+        if len(set(mentions)) != len(mentions) or (mentions and route.kind != "group_chat"):
+            raise ValueError("Only group routes support distinct mentions")
         state = await self.get_state()
         if state is None or state.closed:
             raise ValueError("Meeting must exist and be open to enqueue a message")
@@ -172,21 +190,6 @@ class MeetingCoordinator:
             return result
         await self._notify_queue_changed()
         return await self._request(row)
-
-    async def _send_message(self, member_name: str, content: str, mentions: tuple[str, ...], request_id: str):
-        """Use existing group storage, history, transport, and recipient acknowledgements."""
-        token = set_session_id(self.scope.session_id)
-        try:
-            return await post_message(
-                self._conversation,
-                self._message_manager,
-                member_name,
-                content,
-                client_message_id=request_id,
-                mentions=mentions,
-            )
-        finally:
-            reset_session_id(token)
 
     @property
     def scope(self) -> MeetingScope:
@@ -339,146 +342,75 @@ class MeetingCoordinator:
         return changed
 
     async def grant_next(self, *, playback_ready: bool = True) -> SpeechRequest | None:
-        """Publish one queued message, returning GRANTED audio or terminal TEXT_ONLY.
-
-        The host owns one serialized consumer and supplies current transport readiness.
-        A publication error retains its claim token for retry_publication. None means
-        empty, closed, or blocked by another claim/interruption; it is not completion.
-        """
+        """Claim one request; the host publishes its text and handles playback."""
+        if not isinstance(playback_ready, bool):
+            raise ValueError("Playback readiness must be a boolean")
         dao = await self._dao()
         row = await dao.grant_next(self.scope, playback_ready=playback_ready)
-        if row is None:
-            return None
-        return await self._publish_granted(await self._request(row), playback_ready=playback_ready)
+        return await self._request(row) if row is not None else None
 
-    async def _publish_route(
-        self, member_name: str, content: str, route: MeetingRoute, mentions: tuple[str, ...],
-        request_id: str, *, recover: bool,
-    ) -> tuple[str, ...]:
-        if self._message_manager is None:
-            raise ValueError("Publication requires the Team message manager")
-        if route.kind == "group_chat":
-            if self._conversation is None:
-                raise ValueError("Group publication requires the Team conversation")
-            if recover:
-                # Use the existing group submission identity only on recovery;
-                # an already committed message may outlive its members.
-                identity = str(
-                    uuid5(
-                        NAMESPACE_URL,
-                        json.dumps(
-                            [self.scope.team_name, self.scope.session_id, request_id], ensure_ascii=False
-                        ),
-                    )
-                )
-                source = await self._read_message(identity)
-                if source is not None:
-                    if (source.team_name != self.scope.team_name or not source.broadcast
-                            or not group_metadata(source)):
-                        raise ValueError("Stored publication does not belong to this group")
-                    if (source.from_member_name, source.content, tuple(group_metadata(source)["mentions"])) != (
-                        member_name,
-                        content,
-                        mentions,
-                    ):
-                        raise ValueError("Stored publication does not match the queued utterance")
-                    token = set_session_id(self.scope.session_id)
-                    try:
-                        await sync_history(self._conversation, self._message_manager)
-                        await self._message_manager.publish_broadcast(identity, member_name)
-                    finally:
-                        reset_session_id(token)
-                    return (source.message_id,)
-            posted = await self._send_message(member_name, content, mentions, request_id)
-            return (posted.message.message_id,)
-        recipients = route.recipients if route.kind in ("direct", "multicast") else (None,)
-        ids = tuple(str(uuid5(NAMESPACE_URL, json.dumps(
-            [self.scope.team_name, self.scope.session_id, self.scope.meeting_id, request_id, route.kind, recipient],
-            ensure_ascii=False,
-        ))) for recipient in recipients)
-        token = set_session_id(self.scope.session_id)
-        try:
-            manager = self._message_manager
-            if route.kind == "direct":
-                result = await manager.send_message(
-                    content, route.recipients[0], member_name, route.protocol, message_id=ids[0],
-                )
-                sent = (result,) if result else ()
-            elif route.kind == "multicast":
-                sent = tuple(await manager.multicast_message(
-                    content, list(route.recipients), member_name, route.protocol, message_ids=list(ids),
-                ))
-            elif route.kind == "broadcast":
-                result = await manager.broadcast_message(
-                    content, member_name, message_id=ids[0], protocol=route.protocol,
-                )
-                sent = (result,) if result else ()
-            else:
-                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Unknown queued publication route")
-            if sent != ids:
-                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Team publication did not commit all messages")
-            return ids
-        finally:
-            reset_session_id(token)
-
-    async def _send_queued_text(self, request: SpeechRequest, *, recover: bool) -> tuple[str, ...]:
+    async def record_publication(self, request_id: str, source_message_ids: tuple[str, ...]) -> SpeechRequest:
+        """Validate and link sent messages, including sends completed after revocation."""
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("Request ID must be a nonempty string")
+        if (not isinstance(source_message_ids, tuple) or not source_message_ids
+                or any(not isinstance(value, str) or not value.strip() for value in source_message_ids)):
+            raise ValueError("Publication requires a nonempty tuple of message IDs")
+        if len(set(source_message_ids)) != len(source_message_ids):
+            raise ValueError("Publication requires distinct message IDs")
+        request = await self.get_request(request_id)
+        if request is None:
+            raise ValueError("Meeting request does not exist")
         if request.source_message_ids:
-            return request.source_message_ids
-        if request.source_message_id is not None:
-            return (request.source_message_id,)
-        return await self._publish_route(
-            request.member_name, request.content, request.route, request.mentions, request.request_id, recover=recover,
-        )
-
-    async def _publish_granted(
-        self, request: SpeechRequest, *, recover: bool = False, playback_ready: bool = True,
-    ) -> SpeechRequest | None:
-        """Send only claimed queue content; ordinary reads never publish anything."""
-        state = await self.get_state()
-        if state is None or state.closed or state.lease_token != request.lease_token:
-            return None
-        if request.source_message_id is None:
-            try:
-                source_id = await self._send_queued_text(request, recover=recover)
-                # Preserve the known source in the error result if recording
-                # its durable queue link fails after sending has succeeded.
-                request = replace(request, source_message_id=source_id[0], source_message_ids=source_id)
-                dao = await self._dao()
-                await dao.record_publication(self.scope, request.request_id, source_id)
-                updated = await self.get_request(request.request_id)
-                if updated is None:
-                    return None
-                request = updated
-            except Exception as exc:
-                team_logger.warning("Granted meeting publication failed for %s: %s", request.request_id, exc)
-                request = replace(request, delivery_error="message_publication_failed")
-        # Publishing errors retain ownership so the host retries this same request.
-        if request.delivery_error:
-            state = await self.get_state()
-            if state is None or state.closed or state.lease_token != request.lease_token:
-                return None
-            return request
+            if source_message_ids != request.source_message_ids:
+                raise ValueError("Request already has different publication IDs")
+        elif request.granted_at is None:
+            raise ValueError("Publication requires a previously claimed request")
+        recipients = request.route.recipients if request.route.kind in {"direct", "multicast"} else (None,)
+        if len(source_message_ids) != len(recipients):
+            raise ValueError("Publication requires one message ID per route recipient")
+        for message_id, recipient in zip(source_message_ids, recipients):
+            source = await self._read_message(message_id)
+            if source is None or (source.team_name, source.from_member_name) != (
+                self.scope.team_name, request.member_name,
+            ):
+                raise ValueError("Publication source must belong to the requesting member and session")
+            # Preserve existing-source admission and publication retries.
+            if request.source_message_ids:
+                continue
+            if source.content != request.content:
+                raise ValueError("Publication source must match the queued content")
+            if (source.to_member_name, source.broadcast, source.protocol) != (
+                recipient, request.route.kind in {"broadcast", "group_chat"}, request.route.protocol,
+            ):
+                raise ValueError("Publication source must match the queued route and protocol")
+            metadata = group_metadata(source)
+            if request.route.kind == "group_chat":
+                if not metadata or tuple(metadata.get("mentions", ())) != request.mentions:
+                    raise ValueError("Publication source must match the queued group mentions")
+            elif metadata:
+                raise ValueError("Publication source must match the queued route kind")
         dao = await self._dao()
-        try:
-            row = await dao.finish_publication(self.scope, request.lease_token, playback_ready=playback_ready)
-        except Exception as exc:
-            team_logger.warning("Meeting publication completion failed for %s: %s", request.request_id, exc)
-            return replace(request, delivery_error="message_publication_failed")
+        await dao.record_publication(self.scope, request_id, source_message_ids)
+        updated = await self.get_request(request_id)
+        if updated is None:
+            raise ValueError("Meeting request no longer exists")
+        return updated
+
+    async def finish_publication(self, lease_token: str, *, playback_ready: bool = True) -> SpeechRequest | None:
+        """Finish recorded text publication; playback acknowledgement stays separate."""
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise ValueError("Lease token must be a nonempty string")
+        if not isinstance(playback_ready, bool):
+            raise ValueError("Playback readiness must be a boolean")
+        dao = await self._dao()
+        row = await dao.finish_publication(self.scope, lease_token, playback_ready=playback_ready)
         if row is None:
             return None
         result = await self._request(row)
         if result.status == SpeechRequestStatus.TEXT_ONLY:
             await self._notify_queue_changed()
         return result
-
-    async def retry_publication(
-        self, lease_token: str, *, playback_ready: bool = True,
-    ) -> SpeechRequest | None:
-        """Retry the current publication claim; never create another queue entry."""
-        request = await self.get_speaker()
-        if request is None or request.lease_token != lease_token:
-            return None
-        return await self._publish_granted(request, recover=True, playback_ready=playback_ready)
 
     async def get_speaker(self) -> SpeechRequest | None:
         """Observe the current audio/publication claim, including while disabled."""
