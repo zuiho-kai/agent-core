@@ -25,6 +25,16 @@ from openjiuwen.agent_teams.interaction import (
     is_reserved_name,
     parse_mention,
 )
+from openjiuwen.agent_teams.meeting import (
+    MeetingCoordinator,
+    MeetingMemberClient,
+    MeetingScope,
+    MeetingState,
+    MeetingStatus,
+    SpeechInterruption,
+    SpeechRequest,
+    SpeechRequestStatus,
+)
 from openjiuwen.agent_teams.messager import (
     InProcessMessager,
     Messager,
@@ -70,6 +80,14 @@ from openjiuwen.agent_teams.tiny_agent import (
 )
 
 __all__ = [
+    "MeetingCoordinator",
+    "MeetingMemberClient",
+    "MeetingScope",
+    "MeetingState",
+    "MeetingStatus",
+    "SpeechInterruption",
+    "SpeechRequest",
+    "SpeechRequestStatus",
     "DEFAULT_LEADER_MEMBER_NAME",
     "DeepAgentSpec",
     "ExpertCatalog",

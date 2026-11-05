@@ -167,6 +167,17 @@ class MessageDao:
             return rows
         return await asyncio.to_thread(self._hydrate_rows, rows)
 
+    async def get_message_identity(
+        self, message_id: str, *, session_id: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Read a message's team and sender without hydrating text or changing read state."""
+        model = _get_message_model(session_id)
+        async with self._sessions.read() as session:
+            row = (await session.execute(select(model.team_name, model.from_member_name).where(
+                model.message_id == message_id,
+            ))).one_or_none()
+            return (row.team_name, row.from_member_name) if row is not None else None
+
     async def get_message(self, message_id: str) -> Optional[TeamMessageBase]:
         """Get message information by ID."""
         message_model = _get_message_model()
