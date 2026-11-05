@@ -1,0 +1,90 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Value objects for persisted meeting speaking coordination."""
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import raise_error
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingScope:
+    """Explicit meeting identity, independent of the current session context."""
+
+    session_id: str
+    team_name: str
+    meeting_id: str
+
+    def __post_init__(self) -> None:
+        if not all((self.session_id.strip(), self.team_name.strip(), self.meeting_id.strip())):
+            raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason="Meeting scope identifiers must be non-empty")
+
+
+class MeetingStatus(StrEnum):
+    """Team capability lifecycle; disabling preserves the meeting identity."""
+
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    CLOSED = "closed"
+
+
+class SpeechRequestStatus(StrEnum):
+    """Lifecycle of one request consumed by the host's audio player."""
+
+    QUEUED = "queued"
+    GRANTED = "granted"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechInterruption:
+    """Persisted barrier identity and the revoked turn to stop in the application."""
+
+    interruption_id: str
+    request_id: str | None
+    lease_token: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingState:
+    """Detached observation of a meeting; reading it does not claim playback."""
+
+    scope: MeetingScope
+    leader_member_name: str
+    addressed_members: tuple[str, ...]
+    owner_request_id: str | None
+    lease_token: str | None
+    interruption_id: str | None
+    revision: int
+    status: MeetingStatus = MeetingStatus.ACTIVE
+
+    @property
+    def closed(self) -> bool:
+        """Whether the meeting has permanently closed."""
+        return self.status == MeetingStatus.CLOSED
+
+    @property
+    def enabled(self) -> bool:
+        """Whether new speech requests may be played."""
+        return self.status == MeetingStatus.ACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechRequest:
+    """One queued utterance, optionally linked to an existing Team message."""
+
+    scope: MeetingScope
+    request_id: str
+    member_name: str
+    source_message_id: str | None
+    speech_text: str
+    sequence: int
+    status: SpeechRequestStatus
+    lease_token: str | None
+    created_at: int
+    granted_at: int | None

@@ -25,6 +25,14 @@ from openjiuwen.agent_teams.schema.deep_agent_spec import (
     VisionModelSpec,
     WorkspaceSpec,
 )
+from openjiuwen.agent_teams.schema.meeting import (
+    MeetingScope,
+    MeetingState,
+    MeetingStatus,
+    SpeechInterruption,
+    SpeechRequest,
+    SpeechRequestStatus,
+)
 from openjiuwen.agent_teams.schema.stream import TeamOutputSchema
 from openjiuwen.agent_teams.schema.team import (
     ExternalCliMemberSpec,
@@ -36,6 +44,12 @@ from openjiuwen.agent_teams.schema.team import (
 )
 
 __all__ = [
+    "MeetingScope",
+    "MeetingState",
+    "MeetingStatus",
+    "SpeechInterruption",
+    "SpeechRequest",
+    "SpeechRequestStatus",
     "ConversationMessage", "ConversationAppendResult",
     "AudioModelSpec",
     "DeepAgentSpec",
