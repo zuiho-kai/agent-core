@@ -4,10 +4,11 @@
 """Trusted application boundary over the persisted audio queue."""
 
 import json
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from openjiuwen.agent_teams.schema.events import EventMessage, MeetingQueueChangedEvent, TeamTopic
 from openjiuwen.agent_teams.schema.meeting import (
     MeetingScope,
     MeetingState,
@@ -20,9 +21,11 @@ from openjiuwen.agent_teams.schema.status import MEMBER_DEPARTED_STATUSES
 from openjiuwen.agent_teams.tools.database import TeamDatabase
 from openjiuwen.agent_teams.tools.database.meeting_dao import MeetingDao
 from openjiuwen.agent_teams.tools.models import TeamMeetingBase, TeamSpeechRequestBase
+from openjiuwen.core.common.logging import team_logger
 
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.meeting.member import MeetingMemberClient
+    from openjiuwen.agent_teams.messager import Messager
 
 
 def _require_text(value: str, label: str) -> None:
@@ -39,14 +42,46 @@ class MeetingCoordinator:
     The caller owns the database, scheduling, and audio-stop acknowledgement.
     """
 
-    def __init__(self, database: TeamDatabase, scope: MeetingScope) -> None:
+    def __init__(
+        self, database: TeamDatabase, scope: MeetingScope, *,
+        messager: "Messager | None" = None,
+        on_state_change: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._database = database
         self._scope = scope
+        self._messager = messager
+        self._on_state_change = on_state_change
 
     @property
     def scope(self) -> MeetingScope:
         """Explicit session/team/meeting identity; independent of ambient context."""
         return self._scope
+
+    @property
+    def queue_topic(self) -> str:
+        """Host consumer topic; subscribe before inspecting the pending queue."""
+        return TeamTopic.MEETING_QUEUE.build(self.scope.session_id, self.scope.team_name)
+
+    async def _notify_queue_changed(self) -> None:
+        if self._messager is None:
+            return
+        try:
+            await self._messager.publish(
+                topic_id=self.queue_topic,
+                message=EventMessage.from_event(MeetingQueueChangedEvent(
+                    team_name=self.scope.team_name, meeting_id=self.scope.meeting_id,
+                )),
+            )
+        except Exception as exc:
+            # The database mutation is committed; a failed wake must not invite a duplicate retry.
+            team_logger.warning("Meeting queue wake failed for %s: %s", self.scope.meeting_id, exc)
+
+    async def _notify_lifecycle_changed(self) -> None:
+        try:
+            if self._on_state_change is not None:
+                await self._on_state_change()
+        finally:
+            await self._notify_queue_changed()
 
     def for_member(self, member_name: str) -> "MeetingMemberClient":
         """Bind a trusted runtime identity; membership is rechecked on every call."""
@@ -91,14 +126,18 @@ class MeetingCoordinator:
     async def start(self) -> MeetingState:
         """Create once or inspect the existing meeting, including terminal state."""
         dao = await self._dao()
-        return self._state(await dao.create_meeting(self.scope))
+        state = self._state(await dao.create_meeting(self.scope))
+        await self._notify_lifecycle_changed()
+        return state
 
     async def enable(self) -> MeetingState:
         """Create or resume this exact meeting ID, preserving any interruption barrier."""
         dao = await self._dao()
-        return self._state(await dao.enable_team_meeting(
+        state = self._state(await dao.enable_team_meeting(
             self.scope.session_id, self.scope.team_name, meeting_id=self.scope.meeting_id,
         ))
+        await self._notify_lifecycle_changed()
+        return state
 
     async def get_state(self) -> MeetingState | None:
         """Observe persisted state without claiming audio or creating a meeting."""
@@ -132,10 +171,12 @@ class MeetingCoordinator:
             )
             if identity != (self.scope.team_name, member_name):
                 raise ValueError("Source message must belong to the requesting member and Team/session")
-        return self._request(await dao.enqueue(
+        result = self._request(await dao.enqueue(
             self.scope, request_id if request_id is not None else uuid4().hex, member_name,
             speech_text=speech_text, source_message_id=source_message_id,
         ))
+        await self._notify_queue_changed()
+        return result
 
     async def get_request(self, request_id: str) -> SpeechRequest | None:
         """Inspect a queued, granted, or terminal request without reading its source text."""
@@ -169,7 +210,10 @@ class MeetingCoordinator:
         for name in names:
             _require_text(name, "Addressed member name")
         dao = await self._dao()
-        return await dao.set_addressed_members(self.scope, names)
+        changed = await dao.set_addressed_members(self.scope, names)
+        if changed:
+            await self._notify_queue_changed()
+        return changed
 
     async def grant_next(self) -> SpeechRequest | None:
         """Claim one utterance only when the host is ready to play audio."""
@@ -181,17 +225,26 @@ class MeetingCoordinator:
         """Cancel queued speech while leaving the normal Team message intact."""
         _require_text(request_id, "Request ID")
         dao = await self._dao()
-        return await dao.cancel_request(self.scope, request_id)
+        cancelled = await dao.cancel_request(self.scope, request_id)
+        if cancelled:
+            await self._notify_queue_changed()
+        return cancelled
 
     async def release(self, lease_token: str) -> bool:
         """Acknowledge completed playback for the matching lease; never auto-grant."""
         dao = await self._dao()
-        return await dao.release(self.scope, lease_token)
+        released = await dao.release(self.scope, lease_token)
+        if released:
+            await self._notify_queue_changed()
+        return released
 
     async def interrupt_speech(self, *, expected_token: str | None = None) -> SpeechInterruption | None:
         """Trusted host interruption; stop audio before acknowledging the returned barrier."""
         dao = await self._dao()
-        return await dao.interrupt_speech(self.scope, expected_token=expected_token)
+        interruption = await dao.interrupt_speech(self.scope, expected_token=expected_token)
+        if interruption is not None:
+            await self._notify_queue_changed()
+        return interruption
 
     async def interrupt_from_leader(self, member_name: str, *, expected_token: str) -> SpeechInterruption | None:
         """Authorize a live Leader and interrupt only the observed lease."""
@@ -203,28 +256,43 @@ class MeetingCoordinator:
         if role != "leader" or member_name != state.leader_member_name:
             raise ValueError("Only the meeting Leader may interrupt through the agent boundary")
         dao = await self._dao()
-        return await dao.interrupt_speech(self.scope, expected_token=expected_token)
+        interruption = await dao.interrupt_speech(self.scope, expected_token=expected_token)
+        if interruption is not None:
+            await self._notify_queue_changed()
+        return interruption
 
     async def resume_after_interruption(self, interruption_id: str) -> bool:
         """Host confirms stopped audio and, for human interruption, admitted input."""
         dao = await self._dao()
-        return await dao.resume_after_interruption(self.scope, interruption_id)
+        resumed = await dao.resume_after_interruption(self.scope, interruption_id)
+        if resumed:
+            await self._notify_queue_changed()
+        return resumed
 
     async def force_release(
         self, *, expected_token: str | None = None, expected_interruption_id: str | None = None,
     ) -> bool:
         """Recover only the exact observed lease/barrier; the host must stop abandoned audio."""
         dao = await self._dao()
-        return await dao.force_release(
+        released = await dao.force_release(
             self.scope, expected_token=expected_token, expected_interruption_id=expected_interruption_id,
         )
+        if released:
+            await self._notify_queue_changed()
+        return released
 
     async def disable(self) -> bool:
         """Disable new speech, retaining the current lease, queue, and interruption barrier."""
         dao = await self._dao()
-        return await dao.disable(self.scope)
+        disabled = await dao.disable(self.scope)
+        if disabled:
+            await self._notify_lifecycle_changed()
+        return disabled
 
     async def close(self) -> bool:
         """Permanently close audio coordination; the host stops audio and keeps the database."""
         dao = await self._dao()
-        return await dao.close_meeting(self.scope)
+        closed = await dao.close_meeting(self.scope)
+        if closed:
+            await self._notify_lifecycle_changed()
+        return closed
