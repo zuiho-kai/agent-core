@@ -1,7 +1,7 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Database authority for audio queue admission and priority ordering.
+"""Database authority for audio queue admission, ownership, and recovery.
 
 Mutations lock the meeting row before reading it; creation locks the owning
 Team row. These database locks also serialize independent member processes.
@@ -12,12 +12,18 @@ import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import TypeVar
+from uuid import uuid4
 
 from sqlalchemy import case, inspect, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openjiuwen.agent_teams.schema.meeting import MeetingScope, MeetingStatus, SpeechRequestStatus
+from openjiuwen.agent_teams.schema.meeting import (
+    MeetingScope,
+    MeetingStatus,
+    SpeechInterruption,
+    SpeechRequestStatus,
+)
 from openjiuwen.agent_teams.tools.database.engine import DbSessions, create_meeting_tables, get_current_time
 from openjiuwen.agent_teams.tools.models import (
     Team,
@@ -110,6 +116,11 @@ class MeetingDao:
         Retrying an existing ID returns its persisted state without resuming a
         disabled or closed meeting. The leader identity comes from the Team.
         """
+        return await self._create_or_enable(scope, enable=False, reuse_current=False)
+
+    async def _create_or_enable(
+        self, scope: MeetingScope, *, enable: bool, reuse_current: bool,
+    ) -> TeamMeetingBase:
         await create_meeting_tables(self._sessions, scope.session_id)
         model = _get_meeting_model(scope.session_id)
         async with self._sessions.write() as session:
@@ -119,7 +130,9 @@ class MeetingDao:
             if locked.rowcount != 1:
                 raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting requires an existing Team")
             current = await self._find_team_meeting(session, model, scope.team_name, lock=True)
-            row = await session.get(model, _scope_values(scope), with_for_update=True)
+            row = current if reuse_current and current is not None else await session.get(
+                model, _scope_values(scope), with_for_update=True,
+            )
             if row is None:
                 if current is not None:
                     raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Team already has a non-closed meeting")
@@ -128,8 +141,21 @@ class MeetingDao:
                 )
                 row = model(**_scope_values(scope), leader_member_name=leader)
                 session.add(row)
+            elif enable:
+                if row.status == MeetingStatus.CLOSED:
+                    raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Closed meeting IDs cannot be re-enabled")
+                if row.status == MeetingStatus.DISABLED:
+                    row.status = MeetingStatus.ACTIVE
+                    row.revision += 1
             await session.commit()
             return row
+
+    async def enable_team_meeting(
+        self, session_id: str, team_name: str, *, meeting_id: str | None = None,
+    ) -> TeamMeetingBase:
+        """Create or resume the Team/session's non-closed meeting, preserving barriers."""
+        scope = MeetingScope(session_id, team_name, meeting_id if meeting_id is not None else uuid4().hex)
+        return await self._create_or_enable(scope, enable=True, reuse_current=meeting_id is None)
 
     async def get_meeting(self, scope: MeetingScope) -> TeamMeetingBase | None:
         """Inspect a meeting without acquiring ownership or creating tables."""
@@ -236,3 +262,180 @@ class MeetingDao:
         """Inspect a request in any status without claiming or changing it."""
         model = _get_speech_request_model(scope.session_id)
         return await self._get_row(model, {**_scope_values(scope), "request_id": request_id})
+
+    async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
+        """Atomically lease the highest-ranked queued utterance to the audio consumer."""
+        async with self._locked(scope) as (session, meeting):
+            if (meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id is not None
+                    or meeting.owner_request_id is not None or meeting.lease_token is not None):
+                return None
+            request = await session.scalar(self._pending_query(scope, meeting).limit(1))
+            if request is None:
+                return None
+            request.status = SpeechRequestStatus.GRANTED
+            request.lease_token = uuid4().hex
+            request.granted_at = get_current_time()
+            meeting.owner_request_id = request.request_id
+            meeting.lease_token = request.lease_token
+            meeting.revision += 1
+            return request
+
+    async def cancel_request(self, scope: MeetingScope, request_id: str) -> bool:
+        """Cancel only queued speech; an existing audio lease requires interruption."""
+        model = _get_speech_request_model(scope.session_id)
+        try:
+            async with self._locked(scope) as (session, meeting):
+                result = await session.execute(
+                    update(model).where(
+                        *_scope_filter(model, scope), model.request_id == request_id,
+                        model.status == SpeechRequestStatus.QUEUED,
+                    ).values(status=SpeechRequestStatus.CANCELLED)
+                )
+                if result.rowcount != 1:
+                    return False
+                meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
+
+    @staticmethod
+    async def _get_owner(
+        session: AsyncSession, scope: MeetingScope, meeting: TeamMeetingBase,
+    ) -> TeamSpeechRequestBase | None:
+        if meeting.owner_request_id is None or meeting.lease_token is None:
+            return None
+        model = _get_speech_request_model(scope.session_id)
+        request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
+        if (request is None or request.status != SpeechRequestStatus.GRANTED
+                or request.lease_token != meeting.lease_token):
+            return None
+        return request
+
+    @staticmethod
+    async def _release(
+        session: AsyncSession, scope: MeetingScope, meeting: TeamMeetingBase, status: SpeechRequestStatus,
+    ) -> None:
+        model = _get_speech_request_model(scope.session_id)
+        if meeting.owner_request_id is not None:
+            await session.execute(
+                update(model).where(
+                    *_scope_filter(model, scope), model.request_id == meeting.owner_request_id,
+                    model.status == SpeechRequestStatus.GRANTED, model.lease_token == meeting.lease_token,
+                ).values(status=status)
+            )
+        # Retain the request's token/timestamp for inspection of the ended lease.
+        meeting.owner_request_id = None
+        meeting.lease_token = None
+
+    async def release(self, scope: MeetingScope, lease_token: str) -> bool:
+        """Complete only the matching current grant after the host acknowledges playback."""
+        try:
+            async with self._locked(scope) as (session, meeting):
+                if (not lease_token or meeting.closed or meeting.lease_token != lease_token
+                        or meeting.interruption_id is not None):
+                    return False
+                if await self._get_owner(session, scope, meeting) is None:
+                    return False
+                await self._release(session, scope, meeting, SpeechRequestStatus.COMPLETED)
+                meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
+
+    async def interrupt_speech(
+        self, scope: MeetingScope, *, expected_token: str | None = None,
+    ) -> SpeechInterruption | None:
+        """Revoke speech and block grants until audio-stop/input acknowledgement.
+
+        The trusted host may also open an idle barrier. An optional observed
+        token prevents a delayed interruption from revoking a successor lease.
+        This operation does not interrupt agent execution or deliver text.
+        """
+        try:
+            async with self._locked(scope) as (session, meeting):
+                if meeting.closed or meeting.interruption_id is not None:
+                    return None
+                if expected_token is not None and (not expected_token or meeting.lease_token != expected_token):
+                    return None
+                interruption = SpeechInterruption(uuid4().hex, meeting.owner_request_id, meeting.lease_token)
+                await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
+                meeting.interruption_id = interruption.interruption_id
+                meeting.revision += 1
+                return interruption
+        except _MeetingNotFoundError:
+            return None
+
+    async def resume_after_interruption(self, scope: MeetingScope, interruption_id: str) -> bool:
+        """Acknowledge stopped audio/admitted input for this exact persisted barrier."""
+        try:
+            async with self._locked(scope) as (_, meeting):
+                if not interruption_id or meeting.closed or meeting.interruption_id != interruption_id:
+                    return False
+                meeting.interruption_id = None
+                meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
+
+    async def force_release(
+        self, scope: MeetingScope, *, expected_token: str | None = None,
+        expected_interruption_id: str | None = None,
+    ) -> bool:
+        """Recover the exact observed ownership/barrier state without playback acknowledgement.
+
+        Omitted selectors assert absence. The host must ensure audio is stopped
+        before recovery allows another grant; leases never expire automatically.
+        """
+        if expected_token is None and expected_interruption_id is None:
+            raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason="Force release requires an expected identifier")
+        for value in (expected_token, expected_interruption_id):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise_error(StatusCode.AGENT_TEAM_CONFIG_INVALID, reason="Expected identifiers must be nonempty strings")
+        try:
+            async with self._locked(scope) as (session, meeting):
+                if (meeting.closed or meeting.lease_token != expected_token
+                        or meeting.interruption_id != expected_interruption_id
+                        or (meeting.owner_request_id is not None) != (expected_token is not None)):
+                    return False
+                if expected_token is not None:
+                    if await self._get_owner(session, scope, meeting) is None:
+                        return False
+                    await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
+                meeting.interruption_id = None
+                meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
+
+    async def disable(self, scope: MeetingScope) -> bool:
+        """Block new admission/grants, preserving pending speech, current lease, and barrier."""
+        try:
+            async with self._locked(scope) as (_, meeting):
+                if meeting.closed:
+                    return False
+                if meeting.status != MeetingStatus.DISABLED:
+                    meeting.status = MeetingStatus.DISABLED
+                    meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
+
+    async def close_meeting(self, scope: MeetingScope) -> bool:
+        """Permanently revoke ownership and cancel queued speech; the host stops audio."""
+        model = _get_speech_request_model(scope.session_id)
+        try:
+            async with self._locked(scope) as (session, meeting):
+                if meeting.closed:
+                    return False
+                await self._release(session, scope, meeting, SpeechRequestStatus.INTERRUPTED)
+                await session.execute(
+                    update(model).where(
+                        *_scope_filter(model, scope), model.status == SpeechRequestStatus.QUEUED,
+                    ).values(status=SpeechRequestStatus.CANCELLED)
+                )
+                meeting.interruption_id = None
+                meeting.status = MeetingStatus.CLOSED
+                meeting.revision += 1
+                return True
+        except _MeetingNotFoundError:
+            return False
