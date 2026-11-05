@@ -262,7 +262,7 @@ class MeetingDao:
         source_message_id: str | None = None,
         route: MeetingRoute | None = None,
     ) -> TeamSpeechRequestBase:
-        """Queue full text and summary, or reference an already sent source.
+        """Queue text and speech, speech only with empty content, or an already sent source.
 
         Source identity and recipient validation belong to the wrapper. Database
         constraints reject duplicate IDs and invalid non-null source references.
@@ -274,8 +274,8 @@ class MeetingDao:
         if source_message_id is not None:
             if not source_message_id.strip():
                 raise ValueError("Source message ID must be non-empty")
-        elif content is None or not content.strip():
-            raise ValueError("Queued content must be non-empty")
+        elif not isinstance(content, str) or (content and not content.strip()):
+            raise ValueError("Queued content must be text or an empty string for speech-only requests")
         request_model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
             if meeting.status == MeetingStatus.CLOSED:
@@ -368,7 +368,7 @@ class MeetingDao:
                 return None
             model = _get_speech_request_model(scope.session_id)
             request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
-            if request.source_message_id is None:
+            if request.source_message_id is None and request.content != "":
                 raise ValueError("Cannot finish publication before text is recorded")
             if (request.status == SpeechRequestStatus.PUBLISHING
                     or meeting.status == MeetingStatus.DISABLED or not playback_ready):
@@ -468,7 +468,7 @@ class MeetingDao:
                 model = _get_speech_request_model(scope.session_id)
                 request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
                 if (request is None or request.status != SpeechRequestStatus.GRANTED
-                        or request.source_message_id is None):
+                        or (request.source_message_id is None and request.content != "")):
                     return False
                 await self._release(session, scope, meeting, SpeechRequestStatus.COMPLETED)
                 return True

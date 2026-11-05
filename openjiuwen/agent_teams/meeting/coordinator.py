@@ -126,15 +126,17 @@ class MeetingCoordinator:
         self, member_name: str, content: str, *, speech_text: str,
         route: MeetingRoute, mentions: tuple[str, ...] = (), request_id: str | None = None,
     ) -> SpeechRequest:
-        """Queue content explicitly selected by the host for meeting publication.
+        """Queue host-selected content; an empty string requests speech without text delivery.
 
         Missing or closed meetings reject retries; disabled meetings admit work.
         This trusted primitive does not replace the tool boundary's recipient
         and dispatch policies. Audio eligibility is decided when dequeuing.
         """
-        for label, value in (("Member name", member_name), ("Content", content), ("Speech text", speech_text)):
+        for label, value in (("Member name", member_name), ("Speech text", speech_text)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{label} must be a nonempty string")
+        if not isinstance(content, str) or (content and not content.strip()):
+            raise ValueError("Content must be text or an empty string for speech-only requests")
         if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
             raise ValueError("Request ID must be a nonempty string")
         if not isinstance(route, MeetingRoute) or route.kind not in {"direct", "multicast", "broadcast", "group_chat"}:
