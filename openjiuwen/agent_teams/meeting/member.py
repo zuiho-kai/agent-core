@@ -71,6 +71,7 @@ class MeetingMemberClient:
         return replace(
             request, speech_text="", content=None, source_message_id=None,
             source_message_ids=(), message=None, messages=(), message_error=None,
+            publication_message_ids=(),
         ) if request is not None else None
 
     async def interrupt_speech(self, *, expected_token: str) -> SpeechInterruption | None:

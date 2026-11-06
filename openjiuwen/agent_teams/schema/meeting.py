@@ -92,7 +92,12 @@ class MeetingState:
 
 @dataclass(frozen=True, slots=True)
 class SpeechRequest:
-    """One queued message and utterance, linked to Team messages after sending."""
+    """One queued message and utterance, linked to Team messages after sending.
+
+    ``publication_message_ids`` reserves IDs for sending queued text; it does
+    not imply publication. ``source_message_ids`` links published messages.
+    Speech-only requests have no publication IDs.
+    """
 
     scope: MeetingScope
     request_id: str
@@ -112,6 +117,7 @@ class SpeechRequest:
     message_error: str | None = None
     delivery_error: str | None = None
     messages: tuple["SpeechSource", ...] = ()
+    publication_message_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

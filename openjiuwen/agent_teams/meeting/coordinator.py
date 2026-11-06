@@ -199,6 +199,7 @@ class MeetingCoordinator:
             mentions=tuple(json.loads(row.mentions)), route=route,
             source_message_ids=source_ids, message=first, messages=tuple(messages),
             message_error=message_error,
+            publication_message_ids=expected_ids if row.content != "" else (),
         )
 
     async def start(self) -> MeetingState:
