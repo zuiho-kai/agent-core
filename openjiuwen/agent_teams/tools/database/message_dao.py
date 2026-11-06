@@ -68,6 +68,10 @@ class MessageDao:
         (and read-back correct) without any path stored in the DB. Empty
         content (templated messages, UC-B6) stays inline — ``""`` is not a
         placeholder, so no file is created and no read is triggered.
+
+        Message files cannot be overwritten. A conflicting file (including an
+        orphan from a rolled-back insert) falls back inline; the database still
+        decides which message ID is accepted without changing an existing body.
         """
         if not content:
             return content

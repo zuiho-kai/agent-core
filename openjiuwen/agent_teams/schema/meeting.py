@@ -5,9 +5,22 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import raise_error
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingRoute:
+    """Destination for the normal Team message sent after queue admission."""
+
+    kind: Literal["direct", "multicast", "broadcast", "group_chat"] = "group_chat"
+    recipients: tuple[str, ...] = ()
+    protocol: str = "plain"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "recipients", tuple(self.recipients))
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,10 +45,13 @@ class MeetingStatus(StrEnum):
 
 
 class SpeechRequestStatus(StrEnum):
-    """Lifecycle of one request consumed by the host's audio player."""
+    """Lifecycle of queued text publication and audio playback."""
 
     QUEUED = "queued"
     GRANTED = "granted"
+    PUBLISHING = "publishing"
+    TEXT_ONLY = "text_only"
+    FLUSHING = "flushing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
@@ -76,7 +92,7 @@ class MeetingState:
 
 @dataclass(frozen=True, slots=True)
 class SpeechRequest:
-    """One queued utterance, optionally linked to an existing Team message."""
+    """One queued message and utterance, linked to Team messages after sending."""
 
     scope: MeetingScope
     request_id: str
@@ -88,3 +104,25 @@ class SpeechRequest:
     lease_token: str | None
     created_at: int
     granted_at: int | None
+    content: str | None = None
+    mentions: tuple[str, ...] = ()
+    route: MeetingRoute = MeetingRoute()
+    source_message_ids: tuple[str, ...] = ()
+    message: "SpeechSource | None" = None
+    message_error: str | None = None
+    delivery_error: str | None = None
+    messages: tuple["SpeechSource", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechSource:
+    """Read-only projection of a published normal Team message."""
+
+    scope: MeetingScope
+    message_id: str
+    member_name: str
+    content: str
+    to_member_name: str | None
+    broadcast: bool
+    protocol: str
+    timestamp: int

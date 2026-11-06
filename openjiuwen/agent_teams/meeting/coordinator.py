@@ -6,16 +6,22 @@
 import json
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from sqlalchemy.exc import SQLAlchemyError
+
+from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+from openjiuwen.agent_teams.group_chat.handler import group_metadata
 from openjiuwen.agent_teams.schema.events import EventMessage, MeetingQueueChangedEvent, TeamTopic
 from openjiuwen.agent_teams.schema.meeting import (
+    MeetingRoute,
     MeetingScope,
     MeetingState,
     MeetingStatus,
     SpeechInterruption,
     SpeechRequest,
     SpeechRequestStatus,
+    SpeechSource,
 )
 from openjiuwen.agent_teams.schema.status import MEMBER_DEPARTED_STATUSES
 from openjiuwen.agent_teams.tools.database import TeamDatabase
@@ -24,13 +30,27 @@ from openjiuwen.agent_teams.tools.models import TeamMeetingBase, TeamSpeechReque
 from openjiuwen.core.common.logging import team_logger
 
 if TYPE_CHECKING:
+    from openjiuwen.agent_teams.group_chat.conversation import GroupConversationLog
     from openjiuwen.agent_teams.meeting.member import MeetingMemberClient
     from openjiuwen.agent_teams.messager import Messager
+    from openjiuwen.agent_teams.tools.message_manager import TeamMessageManager
 
 
 def _require_text(value: str, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a nonempty string")
+
+
+def _publication_ids(scope: MeetingScope, request_id: str, route: MeetingRoute) -> tuple[str, ...]:
+    """Stable Team message IDs for publication recovery without another table."""
+    if route.kind == "group_chat":
+        parts = [scope.team_name, scope.session_id, request_id]
+        return (str(uuid5(NAMESPACE_URL, json.dumps(parts, ensure_ascii=False))),)
+    recipients = route.recipients if route.kind in {"direct", "multicast"} else (None,)
+    return tuple(str(uuid5(NAMESPACE_URL, json.dumps(
+        [scope.team_name, scope.session_id, scope.meeting_id, request_id, route.kind, recipient],
+        ensure_ascii=False,
+    ))) for recipient in recipients)
 
 
 class MeetingCoordinator:
@@ -45,11 +65,25 @@ class MeetingCoordinator:
     def __init__(
         self, database: TeamDatabase, scope: MeetingScope, *,
         messager: "Messager | None" = None,
+        message_manager: "TeamMessageManager | None" = None,
+        conversation: "GroupConversationLog | None" = None,
         on_state_change: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
+        if message_manager is not None and (
+            message_manager.db is not database or message_manager.team_name != scope.team_name
+        ):
+            raise ValueError("Message manager must belong to the coordinator's database and Team")
+        if conversation is not None and (
+            conversation.team_name != scope.team_name or conversation.session_id != scope.session_id
+        ):
+            raise ValueError("Conversation must belong to the coordinator's Team and session")
         self._database = database
         self._scope = scope
-        self._messager = messager
+        self._messager = messager if messager is not None else (
+            message_manager.messager if message_manager is not None else None
+        )
+        self._message_manager = message_manager
+        self._conversation = conversation
         self._on_state_change = on_state_change
 
     @property
@@ -94,6 +128,28 @@ class MeetingCoordinator:
         await self._database.initialize()
         return self._database.meeting
 
+    async def _read_message(self, message_id: str):
+        token = set_session_id(self.scope.session_id)
+        try:
+            return await self._database.message.get_message(message_id)
+        finally:
+            reset_session_id(token)
+
+    async def get_source_message(self, source_message_id: str) -> SpeechSource | None:
+        """Read published Team text by ID without acknowledging delivery."""
+        _require_text(source_message_id, "Source message ID")
+        await self._dao()
+        row = await self._read_message(source_message_id)
+        if row is None:
+            return None
+        if row.team_name != self.scope.team_name:
+            raise ValueError("Source message belongs to another Team")
+        return SpeechSource(
+            scope=self.scope, message_id=row.message_id, member_name=row.from_member_name,
+            content=row.content, to_member_name=row.to_member_name, broadcast=row.broadcast,
+            protocol=row.protocol, timestamp=row.timestamp,
+        )
+
     async def _require_member(self, member_name: str) -> str:
         _require_text(member_name, "Member name")
         await self._dao()
@@ -115,12 +171,34 @@ class MeetingCoordinator:
             status=MeetingStatus(row.status),
         )
 
-    def _request(self, row: TeamSpeechRequestBase) -> SpeechRequest:
+    async def _request(self, row: TeamSpeechRequestBase) -> SpeechRequest:
+        route = MeetingRoute(**json.loads(row.routing))
+        expected_ids = _publication_ids(self.scope, row.request_id, route)
+        source_ids = (
+            expected_ids if row.source_message_id == expected_ids[0] else (row.source_message_id,)
+            if row.source_message_id is not None else ()
+        )
+        messages = []
+        message_error = None
+        for message_id in source_ids:
+            try:
+                source = await self.get_source_message(message_id)
+                if source is None:
+                    message_error = "source_message_unavailable"
+                else:
+                    messages.append(source)
+            except (ValueError, RuntimeError, OSError, SQLAlchemyError):
+                message_error = "source_message_unavailable"
+        first = messages[0] if messages else None
         return SpeechRequest(
             scope=self.scope, request_id=row.request_id, member_name=row.member_name,
             source_message_id=row.source_message_id, speech_text=row.speech_text, sequence=row.sequence,
             status=SpeechRequestStatus(row.status), lease_token=row.lease_token,
             created_at=row.created_at, granted_at=row.granted_at,
+            content=first.content if first is not None else row.content,
+            mentions=tuple(json.loads(row.mentions)), route=route,
+            source_message_ids=source_ids, message=first, messages=tuple(messages),
+            message_error=message_error,
         )
 
     async def start(self) -> MeetingState:
@@ -145,35 +223,52 @@ class MeetingCoordinator:
         row = await dao.get_meeting(self.scope)
         return self._state(row) if row is not None else None
 
-    async def request_speech(
-        self, member_name: str, *, speech_text: str, source_message_id: str | None = None,
-        request_id: str | None = None,
+    async def enqueue_message(
+        self, member_name: str, content: str, *, speech_text: str,
+        route: MeetingRoute, mentions: tuple[str, ...] = (), request_id: str | None = None,
     ) -> SpeechRequest:
-        """Admit host-selected speech, optionally referencing a normal Team message.
-
-        The host supplies trusted speaker identity. References must belong to
-        that speaker in this Team/session. Matching request-ID retries return
-        the stored request; no admission automatically grants or delivers text.
-        """
+        """Queue full content for later Team publication and audio playback."""
+        _require_text(member_name, "Member name")
         _require_text(speech_text, "Speech text")
         if request_id is not None:
             _require_text(request_id, "Request ID")
-        if source_message_id is not None:
-            _require_text(source_message_id, "Source message ID")
+        if not isinstance(content, str) or (content and not content.strip()):
+            raise ValueError("Content must be text or empty for speech-only requests")
+        if not isinstance(route, MeetingRoute) or route.kind not in {"direct", "multicast", "broadcast", "group_chat"}:
+            raise ValueError("A supported Meeting route is required")
+        if not isinstance(route.protocol, str) or not route.protocol.strip():
+            raise ValueError("Route protocol must be nonempty")
+        if any(not isinstance(name, str) or not name.strip() for name in route.recipients):
+            raise ValueError("Route recipients must be nonempty")
+        if len(set(route.recipients)) != len(route.recipients):
+            raise ValueError("Route recipients must be distinct")
+        if ((route.kind == "direct" and len(route.recipients) != 1)
+                or (route.kind == "multicast" and not route.recipients)
+                or (route.kind in {"broadcast", "group_chat"} and route.recipients)):
+            raise ValueError("Route recipients do not match route kind")
+        if not isinstance(mentions, tuple) or any(not isinstance(name, str) or not name.strip() for name in mentions):
+            raise ValueError("Mentions must be a tuple of nonempty names")
+        if len(set(mentions)) != len(mentions) or (mentions and route.kind != "group_chat"):
+            raise ValueError("Only group routes support distinct mentions")
         await self._require_member(member_name)
         dao = await self._dao()
         state = await dao.get_meeting(self.scope)
-        if state is None:
-            raise ValueError("Meeting must exist to request speech")
-        if source_message_id is not None:
-            identity = await self._database.message.get_message_identity(
-                source_message_id, session_id=self.scope.session_id,
-            )
-            if identity != (self.scope.team_name, member_name):
-                raise ValueError("Source message must belong to the requesting member and Team/session")
-        result = self._request(await dao.enqueue(
+        if state is None or state.closed:
+            raise ValueError("Meeting must exist and be open to queue content")
+        if request_id is not None:
+            existing = await self.get_request(request_id)
+            if existing is not None:
+                original_content = existing.content
+                if original_content is None and existing.source_message_id is not None:
+                    source = await self._read_message(existing.source_message_id)
+                    original_content = source.content if source is not None else None
+                if (existing.member_name, original_content, existing.speech_text,
+                        existing.route, existing.mentions) != (member_name, content, speech_text, route, mentions):
+                    raise ValueError("Request ID already belongs to different Meeting content")
+                return existing
+        result = await self._request(await dao.enqueue(
             self.scope, request_id if request_id is not None else uuid4().hex, member_name,
-            speech_text=speech_text, source_message_id=source_message_id,
+            speech_text=speech_text, content=content, mentions=mentions, route=route,
         ))
         await self._notify_queue_changed()
         return result
@@ -183,12 +278,12 @@ class MeetingCoordinator:
         _require_text(request_id, "Request ID")
         dao = await self._dao()
         row = await dao.get_request(self.scope, request_id)
-        return self._request(row) if row is not None else None
+        return await self._request(row) if row is not None else None
 
     async def list_pending(self) -> tuple[SpeechRequest, ...]:
         """Inspect the current priority/FIFO order without claiming playback."""
         dao = await self._dao()
-        return tuple(self._request(row) for row in await dao.list_pending(self.scope))
+        return tuple([await self._request(row) for row in await dao.list_pending(self.scope)])
 
     async def get_speaker(self) -> SpeechRequest | None:
         """Inspect the current audio owner, including while disabled."""
@@ -197,10 +292,11 @@ class MeetingCoordinator:
         if meeting is None or meeting.closed or meeting.owner_request_id is None:
             return None
         row = await dao.get_request(self.scope, meeting.owner_request_id)
-        if (row is None or row.status != SpeechRequestStatus.GRANTED or row.lease_token is None
+        if (row is None or row.status not in (SpeechRequestStatus.GRANTED, SpeechRequestStatus.PUBLISHING)
+                or row.lease_token is None
                 or row.lease_token != meeting.lease_token):
             return None
-        return self._request(row)
+        return await self._request(row)
 
     async def set_addressed_members(self, member_names: Iterable[str]) -> bool:
         """Replace trusted host priority metadata without preempting current audio."""
@@ -215,14 +311,71 @@ class MeetingCoordinator:
             await self._notify_queue_changed()
         return changed
 
-    async def grant_next(self) -> SpeechRequest | None:
-        """Claim one utterance only when the host is ready to play audio."""
+    async def grant_next(self, *, playback_ready: bool = True) -> SpeechRequest | None:
+        """Claim one item for text publication, optionally with audio ready."""
+        if not isinstance(playback_ready, bool):
+            raise ValueError("Playback readiness must be boolean")
         dao = await self._dao()
-        row = await dao.grant_next(self.scope)
-        return self._request(row) if row is not None else None
+        row = await dao.grant_next(self.scope, playback_ready=playback_ready)
+        return await self._request(row) if row is not None else None
+
+    async def finish_publication(
+        self, request_id: str, lease_token: str, *, source_message_ids: tuple[str, ...] = (),
+        playback_ready: bool = True,
+    ) -> SpeechRequest | None:
+        """Record normal Team messages and finish the matching publication claim."""
+        _require_text(request_id, "Request ID")
+        _require_text(lease_token, "Lease token")
+        if not isinstance(playback_ready, bool):
+            raise ValueError("Playback readiness must be boolean")
+        if (not isinstance(source_message_ids, tuple)
+                or any(not isinstance(value, str) or not value.strip() for value in source_message_ids)
+                or len(set(source_message_ids)) != len(source_message_ids)):
+            raise ValueError("Publication IDs must be distinct nonempty strings")
+        request = await self.get_request(request_id)
+        if request is None or request.granted_at is None:
+            raise ValueError("Publication requires a claimed request")
+        if source_message_ids:
+            if request.content == "" and request.source_message_id is None:
+                raise ValueError("Speech-only requests do not publish a Team message")
+            expected = _publication_ids(self.scope, request_id, request.route)
+            if source_message_ids != expected:
+                raise ValueError("Publication IDs do not match the queued request and route")
+            recipients = request.route.recipients if request.route.kind in {"direct", "multicast"} else (None,)
+            for message_id, recipient in zip(source_message_ids, recipients):
+                source = await self._read_message(message_id)
+                if source is None or (source.team_name, source.from_member_name) != (
+                    self.scope.team_name, request.member_name,
+                ):
+                    raise ValueError("Publication source must belong to the requesting member and Team")
+                if request.content is not None and source.content != request.content:
+                    raise ValueError("Publication source must match queued content")
+                if (source.to_member_name, source.broadcast, source.protocol) != (
+                    recipient, request.route.kind in {"broadcast", "group_chat"}, request.route.protocol,
+                ):
+                    raise ValueError("Publication source must match queued route")
+                metadata = group_metadata(source)
+                if request.route.kind == "group_chat":
+                    if not metadata or tuple(metadata.get("mentions", ())) != request.mentions:
+                        raise ValueError("Publication source must match queued mentions")
+                elif metadata:
+                    raise ValueError("Non-group publication cannot carry group metadata")
+        elif not request.source_message_ids and request.content != "":
+            raise ValueError("Text must be published before finishing the claim")
+        dao = await self._dao()
+        row = await dao.finish_publication(
+            self.scope, request_id, lease_token, source_message_ids=source_message_ids,
+            playback_ready=playback_ready,
+        )
+        if row is None:
+            return None
+        result = await self._request(row)
+        if result.status == SpeechRequestStatus.TEXT_ONLY:
+            await self._notify_queue_changed()
+        return result
 
     async def cancel_request(self, request_id: str) -> bool:
-        """Cancel queued speech while leaving the normal Team message intact."""
+        """Cancel a queued request before its text is published or audio starts."""
         _require_text(request_id, "Request ID")
         dao = await self._dao()
         cancelled = await dao.cancel_request(self.scope, request_id)

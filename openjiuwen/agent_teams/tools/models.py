@@ -134,7 +134,7 @@ class TeamMeetingBase(SQLModel):
 
 
 class TeamSpeechRequestBase(SQLModel):
-    """Audio requests optionally reference messages owned by Team messaging."""
+    """Pending requests own content; sent requests reference Team messages."""
 
     __abstract__ = True
 
@@ -143,7 +143,10 @@ class TeamSpeechRequestBase(SQLModel):
     request_id: str = Field(primary_key=True)
     member_name: str
     source_message_id: str | None = Field(default=None, nullable=True)
+    content: str | None = Field(default=None, sa_type=Text)
     speech_text: str = Field(nullable=False, sa_type=Text)
+    mentions: str = Field(default="[]", sa_type=Text)
+    routing: str = Field(default='{"kind":"group_chat","recipients":[],"protocol":"plain"}', sa_type=Text)
     sequence: int = Field(sa_type=BigInteger)
     status: str = Field(default=SpeechRequestStatus.QUEUED)
     lease_token: str | None = Field(default=None)

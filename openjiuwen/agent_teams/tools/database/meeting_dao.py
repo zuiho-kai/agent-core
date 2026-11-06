@@ -11,6 +11,7 @@ Callers are trusted runtime code; agent tools must not expose this DAO directly.
 import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import TypeVar
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openjiuwen.agent_teams.schema.meeting import (
+    MeetingRoute,
     MeetingScope,
     MeetingStatus,
     SpeechInterruption,
@@ -31,6 +33,7 @@ from openjiuwen.agent_teams.tools.models import (
     TeamMember,
     TeamSpeechRequestBase,
     _get_meeting_model,
+    _get_message_model,
     _get_speech_request_model,
 )
 from openjiuwen.core.common.exception.codes import StatusCode
@@ -181,14 +184,16 @@ class MeetingDao:
         member_name: str,
         *,
         speech_text: str,
+        content: str | None = None,
+        mentions: Iterable[str] = (),
+        route: MeetingRoute | None = None,
         source_message_id: str | None = None,
     ) -> TeamSpeechRequestBase:
-        """Admit an agent's utterance with an optional existing Team message ID.
+        """Admit pending text and speech without requiring a sent message.
 
         Identical request-ID retries return the stored request in any status;
-        conflicting retries fail. Only active meetings admit new requests.
-        Source identity validation belongs to the wrapper; database constraints
-        reject invalid or duplicate non-null message references.
+        conflicting retries fail. Open disabled meetings still admit text.
+        Database constraints reject invalid or duplicate non-null message references.
         """
         if not request_id.strip():
             raise ValueError("Request ID must be non-empty")
@@ -196,18 +201,33 @@ class MeetingDao:
             raise ValueError("Speech text must be non-empty")
         if source_message_id is not None and not source_message_id.strip():
             raise ValueError("Source message ID must be non-empty")
+        if source_message_id is None and (not isinstance(content, str) or (content and not content.strip())):
+            raise ValueError("Queued content must be text or empty for speech-only requests")
+        route = route or MeetingRoute()
+        mentions = tuple(mentions)
+        encoded_mentions = json.dumps(mentions)
+        encoded_route = json.dumps(asdict(route))
         model = _get_speech_request_model(scope.session_id)
         async with self._locked(scope) as (session, meeting):
             key = {**_scope_values(scope), "request_id": request_id}
             existing = await session.get(model, key)
             if existing is not None:
-                if (existing.member_name, existing.speech_text, existing.source_message_id) != (
-                    member_name, speech_text, source_message_id,
+                if existing.content is None and existing.source_message_id is not None:
+                    source = await session.get(_get_message_model(scope.session_id), existing.source_message_id)
+                    if (source is not None and source.content == content and
+                            (existing.member_name, existing.speech_text,
+                             existing.mentions, existing.routing) == (
+                                member_name, speech_text, encoded_mentions, encoded_route,
+                            )):
+                        return existing
+                if (existing.member_name, existing.speech_text, existing.source_message_id,
+                        existing.content, existing.mentions, existing.routing) != (
+                    member_name, speech_text, source_message_id, content, encoded_mentions, encoded_route,
                 ):
                     raise ValueError("Request ID already belongs to a different speech request")
                 return existing
-            if meeting.status != MeetingStatus.ACTIVE:
-                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting must be active to queue speech")
+            if meeting.status == MeetingStatus.CLOSED:
+                raise_error(StatusCode.AGENT_TEAM_STATE_INVALID, reason="Meeting must be open to queue speech")
             role = await session.scalar(
                 select(TeamMember.role).where(
                     TeamMember.team_name == scope.team_name, TeamMember.member_name == member_name,
@@ -221,7 +241,10 @@ class MeetingDao:
                 **key,
                 member_name=member_name,
                 source_message_id=source_message_id,
+                content=content,
                 speech_text=speech_text,
+                mentions=encoded_mentions,
+                routing=encoded_route,
                 sequence=meeting.next_sequence,
                 created_at=get_current_time(),
             )
@@ -263,22 +286,59 @@ class MeetingDao:
         model = _get_speech_request_model(scope.session_id)
         return await self._get_row(model, {**_scope_values(scope), "request_id": request_id})
 
-    async def grant_next(self, scope: MeetingScope) -> TeamSpeechRequestBase | None:
-        """Atomically lease the highest-ranked queued utterance to the audio consumer."""
+    async def grant_next(self, scope: MeetingScope, *, playback_ready: bool = True) -> TeamSpeechRequestBase | None:
+        """Claim the highest-ranked request for publication and optional audio."""
         async with self._locked(scope) as (session, meeting):
-            if (meeting.status != MeetingStatus.ACTIVE or meeting.interruption_id is not None
+            if (meeting.status == MeetingStatus.CLOSED or meeting.interruption_id is not None
                     or meeting.owner_request_id is not None or meeting.lease_token is not None):
                 return None
             request = await session.scalar(self._pending_query(scope, meeting).limit(1))
             if request is None:
                 return None
-            request.status = SpeechRequestStatus.GRANTED
+            request.status = (
+                SpeechRequestStatus.GRANTED if playback_ready and meeting.status == MeetingStatus.ACTIVE
+                else SpeechRequestStatus.PUBLISHING
+            )
             request.lease_token = uuid4().hex
             request.granted_at = get_current_time()
             meeting.owner_request_id = request.request_id
             meeting.lease_token = request.lease_token
             meeting.revision += 1
             return request
+
+    async def finish_publication(
+        self, scope: MeetingScope, request_id: str, lease_token: str, *,
+        source_message_ids: tuple[str, ...] = (), playback_ready: bool = True,
+    ) -> TeamSpeechRequestBase | None:
+        """Link sent text, then finish only the matching current claim."""
+        try:
+            async with self._locked(scope) as (session, meeting):
+                model = _get_speech_request_model(scope.session_id)
+                request = await session.get(model, {**_scope_values(scope), "request_id": request_id})
+                if request is None:
+                    return None
+                if request.granted_at is None:
+                    raise ValueError("Publication requires a previously claimed request")
+                if source_message_ids:
+                    first_id = source_message_ids[0]
+                    if request.source_message_id is not None and request.source_message_id != first_id:
+                        raise ValueError("Request already has a different source message")
+                    request.source_message_id = first_id
+                    request.content = None
+                if (not lease_token or meeting.closed or meeting.lease_token != lease_token
+                        or meeting.owner_request_id != request_id or request.lease_token != lease_token):
+                    return None
+                if request.source_message_id is None and request.content != "":
+                    raise ValueError("Cannot finish publication before text is recorded")
+                if (request.status == SpeechRequestStatus.PUBLISHING
+                        or meeting.status == MeetingStatus.DISABLED or not playback_ready):
+                    await self._release(session, scope, meeting, SpeechRequestStatus.TEXT_ONLY)
+                    request.status = SpeechRequestStatus.TEXT_ONLY
+                    request.lease_token = None
+                    meeting.revision += 1
+                return request
+        except _MeetingNotFoundError:
+            return None
 
     async def cancel_request(self, scope: MeetingScope, request_id: str) -> bool:
         """Cancel only queued speech; an existing audio lease requires interruption."""
@@ -306,7 +366,7 @@ class MeetingDao:
             return None
         model = _get_speech_request_model(scope.session_id)
         request = await session.get(model, {**_scope_values(scope), "request_id": meeting.owner_request_id})
-        if (request is None or request.status != SpeechRequestStatus.GRANTED
+        if (request is None or request.status not in (SpeechRequestStatus.GRANTED, SpeechRequestStatus.PUBLISHING)
                 or request.lease_token != meeting.lease_token):
             return None
         return request
@@ -320,7 +380,8 @@ class MeetingDao:
             await session.execute(
                 update(model).where(
                     *_scope_filter(model, scope), model.request_id == meeting.owner_request_id,
-                    model.status == SpeechRequestStatus.GRANTED, model.lease_token == meeting.lease_token,
+                    model.status.in_((SpeechRequestStatus.GRANTED, SpeechRequestStatus.PUBLISHING)),
+                    model.lease_token == meeting.lease_token,
                 ).values(status=status)
             )
         # Retain the request's token/timestamp for inspection of the ended lease.
@@ -334,7 +395,9 @@ class MeetingDao:
                 if (not lease_token or meeting.closed or meeting.lease_token != lease_token
                         or meeting.interruption_id is not None):
                     return False
-                if await self._get_owner(session, scope, meeting) is None:
+                owner = await self._get_owner(session, scope, meeting)
+                if (owner is None or owner.status != SpeechRequestStatus.GRANTED
+                        or (owner.source_message_id is None and owner.content != "")):
                     return False
                 await self._release(session, scope, meeting, SpeechRequestStatus.COMPLETED)
                 meeting.revision += 1
@@ -408,7 +471,7 @@ class MeetingDao:
             return False
 
     async def disable(self, scope: MeetingScope) -> bool:
-        """Block new admission/grants, preserving pending speech, current lease, and barrier."""
+        """Disable audio while allowing queued text to drain without playback."""
         try:
             async with self._locked(scope) as (_, meeting):
                 if meeting.closed:
