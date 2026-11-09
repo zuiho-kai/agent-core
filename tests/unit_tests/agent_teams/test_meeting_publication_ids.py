@@ -145,3 +145,62 @@ async def test_member_speaker_view_redacts_reserved_ids(runtime):
     assert observed.publication_message_ids == ()
     assert observed.source_message_ids == ()
     assert observed.content is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("changed_fields", "error"), [
+    ({"from_member_name": "observer"}, "belong to the requesting member"),
+    ({"content": "Different body"}, "match queued content"),
+    ({"to_member_name": "bob"}, "match queued route"),
+])
+async def test_reserved_id_does_not_allow_mismatched_publication(runtime, changed_fields, error):
+    meeting = runtime.meeting
+    await meeting.for_member("speaker").enqueue_message(
+        "Queued body", speech_text="Spoken summary", route=MeetingRoute("direct", ("alice",)),
+    )
+    claim = await meeting.grant_next()
+    message_fields = {
+        "from_member_name": "speaker", "content": "Queued body", "to_member_name": "alice",
+        **changed_fields,
+    }
+    assert await runtime.db.message.create_message(
+        claim.publication_message_ids[0], runtime.scope.team_name, **message_fields,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        await meeting.finish_publication(
+            claim.request_id, claim.lease_token, source_message_ids=claim.publication_message_ids,
+        )
+
+    current = await meeting.get_speaker()
+    assert current.lease_token == claim.lease_token
+    assert current.source_message_ids == ()
+    assert current.content == "Queued body"
+    assert not await meeting.release(claim.lease_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("disabled", "playback_ready"), [
+    (False, False),
+    (True, True),
+], ids=["audio-not-ready", "meeting-disabled"])
+async def test_text_can_publish_without_a_playback_grant(runtime, disabled, playback_ready):
+    meeting = runtime.meeting
+    if disabled:
+        assert await meeting.disable()
+    queued = await meeting.for_member("speaker").enqueue_message(
+        "Publish this text", speech_text="Skip this audio", route=MeetingRoute("broadcast"),
+    )
+
+    claim = await meeting.grant_next(playback_ready=playback_ready)
+    assert claim.request_id == queued.request_id
+    assert claim.status == SpeechRequestStatus.PUBLISHING
+    assert not await meeting.release(claim.lease_token)
+    message_id = await runtime.manager.broadcast_message(claim.content, message_id=claim.publication_message_ids[0])
+    finished = await meeting.finish_publication(claim.request_id, claim.lease_token, source_message_ids=(message_id,))
+
+    assert finished.status == SpeechRequestStatus.TEXT_ONLY
+    assert finished.lease_token is None
+    assert finished.source_message_ids == (message_id,)
+    assert (await runtime.db.message.get_message(message_id)).content == "Publish this text"
+    assert await meeting.get_speaker() is None
